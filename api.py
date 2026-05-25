@@ -49,3 +49,13 @@ async def reserve_flight_seat(
             status_code=409,
             detail="Seat is already reserved or unavailable.",
         )
+
+    background_tasks.add_task(
+        process_order_timeout,
+        redis,
+        str(order.id),
+        str(req.flight_id),
+        req.seat_code,
+    )
+
+    return OrderResponse.model_validate(order)
