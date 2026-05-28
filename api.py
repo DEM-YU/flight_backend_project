@@ -58,3 +58,14 @@ async def reserve_flight_seat(
             status_code=409,
             detail="Seat is already reserved or unavailable.",
         )
+
+    # Register distributed timeout release task asynchronously (Executes post-HTTP response to eliminate client blocking)
+    background_tasks.add_task(
+        process_order_timeout,
+        redis,
+        str(order.id),
+        str(payload.flight_id),
+        payload.seat_code,
+    )
+
+    return OrderResponse.model_validate(order)
