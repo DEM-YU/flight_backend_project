@@ -1,4 +1,3 @@
-from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
 import redis.asyncio as aioredis
@@ -8,28 +7,23 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 class Settings(BaseSettings):
     # PostgreSQL
-    PG_HOST: str = "localhost"
-    PG_PORT: int = 5432
-    PG_USER: str = "flight_user"
-    PG_PASSWORD: str = "flight_pass"
-    PG_DB: str = "flight_db"
+    POSTGRES_USER: str = "flight_user"
+    POSTGRES_PASSWORD: str = "flight_pass"
+    POSTGRES_SERVER: str = "localhost"
+    POSTGRES_PORT: int = 5432
+    POSTGRES_DB: str = "flight_db"
 
     # Redis
-    REDIS_HOST: str = "localhost"
-    REDIS_PORT: int = 6379
+    REDIS_URL: str = "redis://localhost:6379"
 
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     @property
     def pg_dsn(self) -> str:
         return (
-            f"postgresql+asyncpg://{self.PG_USER}:{self.PG_PASSWORD}"
-            f"@{self.PG_HOST}:{self.PG_PORT}/{self.PG_DB}"
+            f"postgresql+asyncpg://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}"
+            f"@{self.POSTGRES_SERVER}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
         )
-
-    @property
-    def redis_url(self) -> str:
-        return f"redis://{self.REDIS_HOST}:{self.REDIS_PORT}"
 
 settings = Settings()
 
@@ -49,7 +43,7 @@ AsyncSessionLocal = async_sessionmaker(
 
 # Redis Connection Pool
 redis_pool = aioredis.ConnectionPool.from_url(
-    settings.redis_url,
+    settings.REDIS_URL,
     max_connections=50,
     decode_responses=True,
 )
