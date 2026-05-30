@@ -32,7 +32,6 @@ else
     return 0
 end
 """
-
 def _cache_key(departure: str, arrival: str, date_str: str) -> str:
     return f"route:{departure}:{arrival}:{date_str}"
 
@@ -115,3 +114,41 @@ async def reserve_seat(
     await db.commit()
     await db.refresh(order)
     return order
+
+
+async def process_order_timeout(
+    redis: aioredis.Redis,
+    order_id: str,
+    flight_id: str,
+    seat_code: str,
+    delay: int = 60,
+) -> None:
+    """
+    Asynchronous order timeout and automatic release worker (BackgroundTask).
+
+    Execution Workflow:
+      1. sleep(delay) enforces the business payment window countdown asynchronously.
+      2. Utilizes an isolated Session for DB queries to decouple from closed HTTP contexts.
+      3. If status remains 'Pending' -> Transition to 'Cancelled' and commit transaction.
+      4. Redis HSET resets seat state to '0', returning inventory back to the ticket pool.
+    """
+    # Step A: Non-blocking delay for the business payment window
+    await asyncio.sleep(delay)
+
+    # Step B: Isolated database session (decoupled from HTTP request lifecycle)
+    async with AsyncSessionLocal() as db:
+        # Step C: State machine transition
+        result = await db.execute(
+            select(Order).where(Order.id == UUID(order_id))
+        )
+        order = result.scalar_one_or_none()
+
+        if order is None or order.status != "Pending":
+            # Order already paid or processed by alternative workflows, idempotent exit executed
+            return
+
+        order.status = "Cancelled"
+        await db.commit()
+
+    # Step D: Cache rollback and inventory replenishment back to ticket pool
+    await redis.hset(f"flight:{flight_id}:seats", seat_code, "0")
