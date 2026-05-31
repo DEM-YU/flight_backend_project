@@ -1,10 +1,26 @@
 import uuid
 from datetime import datetime, timezone
+from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, String
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+
+# ── Domain Constants ──
+
+class OrderStatus(StrEnum):
+    """Finite state machine states for order lifecycle."""
+    PENDING = "Pending"
+    CONFIRMED = "Confirmed"
+    CANCELLED = "Cancelled"
+
+
+class SeatState(StrEnum):
+    """Redis seat hash value semantics."""
+    AVAILABLE = "0"
+    LOCKED = "1"
 
 # ORM Base
 class Base(DeclarativeBase):
@@ -30,6 +46,9 @@ class Flight(Base):
 class Seat(Base):
     # Seat Table: Tracks localized seat locking states per flight for isolation.
     __tablename__ = "seats"
+    __table_args__ = (
+        UniqueConstraint("flight_id", "seat_code", name="uq_seat_flight_seat_code"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
@@ -44,6 +63,9 @@ class Seat(Base):
 class Order(Base):
     # Order Table: Records user booking behaviors with a default 'Pending' state.
     __tablename__ = "orders"
+    __table_args__ = (
+        Index("ix_order_status_created", "status", "created_at"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
@@ -53,7 +75,9 @@ class Order(Base):
         UUID(as_uuid=True), ForeignKey("flights.id", ondelete="RESTRICT"), nullable=False
     )
     seat_code: Mapped[str] = mapped_column(String(8), nullable=False)
-    status: Mapped[str] = mapped_column(String(32), default="Pending", nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32), default=OrderStatus.PENDING, nullable=False,
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
