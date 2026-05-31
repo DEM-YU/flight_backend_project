@@ -32,6 +32,7 @@ engine = create_async_engine(
     settings.pg_dsn,
     pool_size=10,
     max_overflow=20,
+    pool_timeout=5,      # fast-fail under pool exhaustion (default 30s is too long)
     pool_pre_ping=True,  # auto-recover stale connections
     echo=False,
 )
