@@ -6,14 +6,13 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 
 class Settings(BaseSettings):
-    # PostgreSQL
+    """App configuration, loaded from .env with sensible local defaults."""
     POSTGRES_USER: str = "flight_user"
     POSTGRES_PASSWORD: str = "flight_pass"
     POSTGRES_SERVER: str = "localhost"
     POSTGRES_PORT: int = 5432
     POSTGRES_DB: str = "flight_db"
 
-    # Redis
     REDIS_URL: str = "redis://localhost:6379"
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
@@ -27,13 +26,13 @@ class Settings(BaseSettings):
 
 settings = Settings()
 
-# SQLAlchemy Async Engine
+
 engine = create_async_engine(
     settings.pg_dsn,
     pool_size=10,
     max_overflow=20,
-    pool_timeout=5,      # fast-fail under pool exhaustion (default 30s is too long)
-    pool_pre_ping=True,  # auto-recover stale connections
+    pool_timeout=5,
+    pool_pre_ping=True,
     echo=False,
 )
 
@@ -42,23 +41,23 @@ AsyncSessionLocal = async_sessionmaker(
     expire_on_commit=False,
 )
 
-# Redis Connection Pool
+
 redis_pool = aioredis.ConnectionPool.from_url(
     settings.REDIS_URL,
     max_connections=50,
     decode_responses=True,
 )
 
-# FastAPI Dependencies
+
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
-    """Yields an async PostgreSQL session, auto-closes on exit."""
+    """FastAPI dependency. Yields a scoped async PG session."""
     async with AsyncSessionLocal() as session:
         yield session
 
 
 async def get_redis() -> AsyncGenerator[aioredis.Redis, None]:
-    """Yields a Redis client from the shared connection pool."""
+    """FastAPI dependency. Yields a Redis client, auto-closed on exit."""
     client = aioredis.Redis(connection_pool=redis_pool)
     try:
         yield client

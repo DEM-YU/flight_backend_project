@@ -1,15 +1,4 @@
-"""
-seed.py — Initialize test data for the application.
 
-Execution order:
-  1. Create tables (CREATE TABLE IF NOT EXISTS)
-  2. Seed a test flight record
-  3. Seed 30 seat records (1A ~ 30A)
-  4. Initialize seat status in Redis Hash (0 = Available)
-
-Usage:
-  python seed.py
-"""
 
 import asyncio
 import uuid
@@ -21,26 +10,23 @@ import redis.asyncio as aioredis
 from database import AsyncSessionLocal, engine, settings
 from models import Base, Flight, Seat, SeatState
 
-# ── Fixed flight_id for compatibility with the stress testing script ──
+
 FLIGHT_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
 SEAT_COUNT = 30
-SEAT_DB_STATUS_AVAILABLE = 0  # Integer value for seats.status column (0 = available)
+SEAT_DB_STATUS_AVAILABLE = 0
 
 
 async def main() -> None:
-    # 1. Create database schema
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    print("✅ Database tables created successfully")
+    print("[INFO] Tables created.")
 
     async with AsyncSessionLocal() as db:
-        # 2. Check if the test flight already exists to avoid duplicate seeding
         from sqlalchemy import select
         existing = await db.execute(select(Flight).where(Flight.id == FLIGHT_ID))
         if existing.scalar_one_or_none():
-            print("⚠️  Test flight already exists, skipping database seed")
+            print("[WARN] Test flight already exists, skipping.")
         else:
-            # Insert flight
             flight = Flight(
                 id=FLIGHT_ID,
                 flight_num="TEST-001",
@@ -50,7 +36,6 @@ async def main() -> None:
             )
             db.add(flight)
 
-            # Insert seats
             seats = [
                 Seat(
                     id=uuid.uuid4(),
@@ -62,19 +47,16 @@ async def main() -> None:
             ]
             db.add_all(seats)
             await db.commit()
-            print(f"✅ Flight {FLIGHT_ID} and {SEAT_COUNT} seats seeded in PostgreSQL")
+            print(f"[INFO] Flight {FLIGHT_ID} and {SEAT_COUNT} seats inserted.")
 
-    # 3. Seed initial seat inventory status in Redis Hash
     redis = aioredis.Redis.from_url(settings.REDIS_URL, decode_responses=True)
     seat_key = f"flight:{FLIGHT_ID}:seats"
 
-    # Batch write: HSET flight:<id>:seats 1A 0 2A 0 ... 30A 0
     seat_map = {f"{i}A": SeatState.AVAILABLE for i in range(1, SEAT_COUNT + 1)}
     await redis.hset(seat_key, mapping=seat_map)
     await redis.aclose()
-    print(f"✅ Seeded {SEAT_COUNT} seat statuses in Redis Hash [{seat_key}]")
-
-    print("\n🎉 Seed data initialization complete! Ready for stress testing.")
+    print(f"[INFO] {SEAT_COUNT} seats seeded in Redis [{seat_key}].")
+    print("[INFO] Seed complete.")
 
 
 if __name__ == "__main__":

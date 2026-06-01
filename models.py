@@ -8,27 +8,27 @@ from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
-# ── Domain Constants ──
+
 
 class OrderStatus(StrEnum):
-    """Finite state machine states for order lifecycle."""
+    """Order lifecycle states: Pending -> Confirmed or Cancelled."""
     PENDING = "Pending"
     CONFIRMED = "Confirmed"
     CANCELLED = "Cancelled"
 
 
 class SeatState(StrEnum):
-    """Redis seat hash value semantics."""
+    """Redis hash values representing seat availability."""
     AVAILABLE = "0"
     LOCKED = "1"
 
-# ORM Base
+
 class Base(DeclarativeBase):
     pass
 
-# ORM Models
+
 class Flight(Base):
-    # Flight Table: Leverages compound index to optimize high-frequency route queries.
+    """Scheduled flight with a compound index on (departure, arrival) for route lookups."""
     __tablename__ = "flights"
     __table_args__ = (
         Index("ix_flight_departure_arrival", "departure", "arrival"),
@@ -44,7 +44,7 @@ class Flight(Base):
 
 
 class Seat(Base):
-    # Seat Table: Tracks localized seat locking states per flight for isolation.
+    """Per-flight seat record. Uniqueness enforced at DB level via (flight_id, seat_code)."""
     __tablename__ = "seats"
     __table_args__ = (
         UniqueConstraint("flight_id", "seat_code", name="uq_seat_flight_seat_code"),
@@ -61,7 +61,7 @@ class Seat(Base):
     status: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
 class Order(Base):
-    # Order Table: Records user booking behaviors with a default 'Pending' state.
+    """Booking order. Indexed on (status, created_at) to support timeout scans."""
     __tablename__ = "orders"
     __table_args__ = (
         Index("ix_order_status_created", "status", "created_at"),
@@ -84,10 +84,10 @@ class Order(Base):
         nullable=False,
     )
 
-# pydantic schemas
+
 
 class FlightResponse(BaseModel):
-    # Flight information response schema.
+    """Public flight info returned to clients."""
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
@@ -98,13 +98,13 @@ class FlightResponse(BaseModel):
 
 
 class ReserveRequest(BaseModel):
-   # Seat pre-locking request schema.
+    """Payload for seat reservation requests."""
     flight_id: uuid.UUID
     seat_code: str
 
 
 class OrderResponse(BaseModel):
-    # Order response schema.
+    """Full order details returned after a successful reservation."""
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID

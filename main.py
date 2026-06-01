@@ -17,16 +17,15 @@ from models import Base
 logger = logging.getLogger(__name__)
 
 
-# Lifespan
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """Create tables on startup, dispose engine on shutdown."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     yield
     await engine.dispose()
 
-# app
+
 
 app = FastAPI(
     title="Flight Booking API",
@@ -36,10 +35,9 @@ app = FastAPI(
 )
 
 
-# ── Global Exception Handlers (CR-06) ──
-
 @app.exception_handler(OperationalError)
 async def db_exception_handler(request: Request, exc: OperationalError) -> JSONResponse:
+    """Catch unhandled DB failures globally and return 503."""
     logger.error("Database operational error on %s: %s", request.url.path, exc, exc_info=True)
     return JSONResponse(
         status_code=503,
@@ -49,6 +47,7 @@ async def db_exception_handler(request: Request, exc: OperationalError) -> JSONR
 
 @app.exception_handler(RedisConnectionError)
 async def redis_exception_handler(request: Request, exc: RedisConnectionError) -> JSONResponse:
+    """Catch unhandled Redis failures globally and return 503."""
     logger.error("Redis connection error on %s: %s", request.url.path, exc, exc_info=True)
     return JSONResponse(
         status_code=503,
@@ -56,19 +55,13 @@ async def redis_exception_handler(request: Request, exc: RedisConnectionError) -
     )
 
 
-#  Routes
-
 @app.get("/health", tags=["Infrastructure"])
 async def health_check(
     db: Annotated[AsyncSession, Depends(get_db)],
     redis: Annotated[aioredis.Redis, Depends(get_redis)],
     response: Response,
 ) -> dict:
-    """
-    Liveness & readiness probe.
-    Verifies connectivity to both PostgreSQL and Redis.
-    Returns HTTP 503 when any dependency is degraded.
-    """
+    """Liveness probe. Returns 503 if PG or Redis is unreachable."""
     status = {"status": "ok", "postgres": "unknown", "redis": "unknown"}
 
     try:

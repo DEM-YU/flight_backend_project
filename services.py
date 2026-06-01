@@ -15,18 +15,15 @@ from models import FlightResponse, OrderStatus, SeatState, Flight, Order
 
 logger = logging.getLogger(__name__)
 
-# Cache Configuration
+_CACHE_TTL_BASE = 1800
+_CACHE_TTL_JITTER = 300
+# Short TTL for empty results so newly added flights become visible quickly.
+_CACHE_EMPTY_TTL = 60
 
-_CACHE_TTL_BASE = 1800       # 30-minute base duration
-_CACHE_TTL_JITTER = 300      # ±5 minutes randomization to mitigate stampedes
-_CACHE_EMPTY_TTL = 60        # Short TTL for empty results to prevent cache penetration
-
-# Order Timeout Configuration
-
-_ORDER_TIMEOUT_SECONDS = 60  # Payment window before auto-cancellation
+_ORDER_TIMEOUT_SECONDS = 60
 _SEAT_RELEASE_MAX_RETRIES = 3
 
-# Custom Exceptions
+
 
 
 class SeatUnavailableException(Exception):
@@ -37,12 +34,10 @@ class SeatNotFoundException(Exception):
     """Seat does not exist or Redis key is not initialized."""
 
 
-# ── Lua Script: Atomic seat checking and locking mechanism ──
-# KEYS[1] : Hash table name, structured as flight:{flight_id}:seats
-# ARGV[1] : Target seat identifier, e.g., '12A'
-# Returns  1 = Lock acquired successfully
-# Returns  0 = Already locked by another reservation
-# Returns -1 = Seat does not exist (HGET returns nil)
+# Lua check-and-set: HGET nil means seat was never initialized, distinct from
+# already-locked. Single EVAL round-trip avoids WATCH/MULTI race windows.
+# TODO: register the script with SCRIPT LOAD and call via EVALSHA to save
+# bandwidth on repeated invocations under high concurrency.
 RESERVE_SEAT_SCRIPT = """
 local status = redis.call('HGET', KEYS[1], ARGV[1])
 if status == false then
@@ -57,7 +52,6 @@ end
 
 
 def _cache_key(departure: str, arrival: str, date_str: str) -> str:
-    """Build a normalized cache key (uppercase city codes to prevent duplicates)."""
     return f"route:{departure.upper()}:{arrival.upper()}:{date_str}"
 
 
@@ -68,22 +62,17 @@ async def search_flights(
     arrival: str,
     travel_date: date,
 ) -> tuple[list[FlightResponse], bool]:
-    """
-    Query flight data implementing the Cache-Aside pattern.
-
-    Returns:
-        tuple: (flights, is_from_cache) to provide granular layer observability.
-    """
+    """Cache-Aside flight query by route and date. Returns (results, cache_hit)."""
     date_str = travel_date.isoformat()
     key = _cache_key(departure, arrival, date_str)
 
-    # Step A: Cache Hit
+    # 1. Try cache
     cached = await redis.get(key)
     if cached is not None:
         data = json.loads(cached)
         return [FlightResponse(**item) for item in data], True
 
-    # Step B: Cache Miss → Query DB
+    # 2. Cache miss, query PG
     day_start = datetime(
         travel_date.year, travel_date.month, travel_date.day,
         tzinfo=timezone.utc,
@@ -101,7 +90,10 @@ async def search_flights(
     flights = result.scalars().all()
     schemas = [FlightResponse.model_validate(f) for f in flights]
 
-    # Step C: Write-Back with jitter TTL; cache empty results with short TTL
+    # 3. Write back with jittered TTL
+    # Jitter avoids thundering-herd on TTL expiry across multiple keys.
+    # TODO: add a bloom filter layer in front to reject impossible routes
+    # without hitting Redis or PG at all.
     payload = json.dumps([s.model_dump(mode="json") for s in schemas])
     ttl = (
         _CACHE_EMPTY_TTL if not schemas
@@ -119,16 +111,10 @@ async def reserve_seat(
     flight_id: UUID,
     seat_code: str,
 ) -> Order:
-    """
-    Atomic seat reservation: Redis Lua concurrency guard -> PostgreSQL order persistence.
-
-    Raises:
-        SeatNotFoundException:    Seat key does not exist in Redis.
-        SeatUnavailableException: Seat is already locked by another reservation.
-    """
+    """Acquire a Redis seat lock via Lua, then persist a Pending order to PG."""
     seat_key = f"flight:{flight_id}:seats"
 
-    # Step 1: Redis atomic concurrency control to prevent overselling
+    # 1. Atomic seat lock via Lua
     result = await redis.eval(RESERVE_SEAT_SCRIPT, 1, seat_key, seat_code)
     if result == -1:
         raise SeatNotFoundException(
@@ -139,7 +125,9 @@ async def reserve_seat(
             f"Seat {seat_code} on flight {flight_id} is unavailable."
         )
 
-    # Step 2: PostgreSQL transactional order persistence with compensating rollback
+    # 2. Persist order, with compensating Redis rollback on failure.
+    # If PG write fails after Redis lock, we must roll back the lock.
+    # Without this, the seat stays locked forever with no matching order.
     try:
         order = Order(
             id=uuid.uuid4(),
@@ -157,7 +145,6 @@ async def reserve_seat(
         )
         return order
     except Exception:
-        # Compensating transaction: release the Redis lock to prevent ghost locks
         logger.error(
             "DB commit failed for seat %s on flight %s, rolling back Redis lock",
             seat_code, flight_id, exc_info=True,
@@ -174,39 +161,35 @@ async def process_order_timeout(
     seat_code: str,
     delay: int = _ORDER_TIMEOUT_SECONDS,
 ) -> None:
-    """
-    Asynchronous order timeout and automatic release worker (BackgroundTask).
+    """Background task: auto-cancel unpaid orders after the payment window expires."""
+    # TODO: replace with a durable job queue (Celery / pg-based outbox) so
+    # timeouts survive process restarts. In-process sleep is a pragmatic
+    # starting point but loses tasks on crash.
 
-    Execution Workflow:
-      1. sleep(delay) enforces the business payment window countdown asynchronously.
-      2. Utilizes an isolated Session for DB queries to decouple from closed HTTP contexts.
-      3. If status remains 'Pending' -> Transition to 'Cancelled' and commit transaction.
-      4. Redis HSET resets seat state to '0', returning inventory back to the ticket pool.
-    """
-    # Step A: Non-blocking delay for the business payment window
+    # 1. Wait for payment window
     await asyncio.sleep(delay)
 
-    # Step B: Isolated database session (decoupled from HTTP request lifecycle)
+    # 2. Check order status in an isolated session
     async with AsyncSessionLocal() as db:
-        # Step C: State machine transition
         result = await db.execute(
             select(Order).where(Order.id == UUID(order_id))
         )
         order = result.scalar_one_or_none()
 
         if order is None or order.status != OrderStatus.PENDING:
-            # Order already paid or processed by alternative workflows, idempotent exit
             logger.info(
                 "Order %s timeout check: status=%s, no action needed",
                 order_id, order.status if order else "NOT_FOUND",
             )
             return
 
+        # 3. Cancel the order
         order.status = OrderStatus.CANCELLED
         await db.commit()
         logger.info("Order %s auto-cancelled after %ds timeout", order_id, delay)
 
-    # Step D: Cache rollback with retry and logging
+    # 4. Release seat lock with retries
+    # Retry with linear backoff; Redis blip shouldn't leave a ghost lock.
     seat_key = f"flight:{flight_id}:seats"
     for attempt in range(_SEAT_RELEASE_MAX_RETRIES):
         try:
@@ -225,7 +208,7 @@ async def process_order_timeout(
             if attempt < _SEAT_RELEASE_MAX_RETRIES - 1:
                 await asyncio.sleep(1 * (attempt + 1))
 
-    # All retries exhausted — critical alert
+    # Retries exhausted. Seat is locked in Redis but cancelled in PG.
     logger.critical(
         "GHOST LOCK: Seat %s on flight %s is locked in Redis but order %s "
         "is cancelled in DB. Manual intervention required.",

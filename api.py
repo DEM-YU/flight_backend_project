@@ -28,15 +28,11 @@ async def list_flights(
     arrival: Annotated[str, Query(min_length=1, max_length=64)],
     travel_date: Annotated[date, Query(description="Travel date in YYYY-MM-DD format")],
 ) -> list[FlightResponse]:
-
-    # Flight route query API strictly executing the Cache-Aside pattern.
-    # Response header 'X-Cache-Status' is included for monitoring and debugging.
-
+    """Search flights by route and date. Uses Cache-Aside backed by Redis."""
     flights, is_from_cache = await search_flights(
         db, redis, departure.strip().upper(), arrival.strip().upper(), travel_date,
     )
 
-    # Inject cache status response header
     response.headers["X-Cache-Status"] = "HIT" if is_from_cache else "MISS"
 
     return flights
@@ -49,15 +45,8 @@ async def reserve_flight_seat(
     db: Annotated[AsyncSession, Depends(get_db)],
     redis: Annotated[aioredis.Redis, Depends(get_redis)],
 ) -> OrderResponse:
-    """
-    Atomic seat reservation API.
-    - Uses Redis Lua scripts to ensure concurrency safety and prevent overselling.
-    - Persists a 'Pending' order in PostgreSQL immediately upon successful lock.
-    - Automatically registers a 60-second timeout release task for eventual consistency.
-    - Returns HTTP 404 if seat does not exist.
-    - Returns HTTP 409 on seat conflicts.
-    """
-    # Mock current authenticated user (in production injected by JWT middleware)
+    """Reserve a seat atomically and schedule a background payment timeout."""
+    # In production this comes from JWT middleware.
     mock_user_id = uuid.uuid4()
     try:
         order = await reserve_seat(
@@ -74,7 +63,6 @@ async def reserve_flight_seat(
             detail="Seat is already reserved or unavailable.",
         )
 
-    # Register distributed timeout release task asynchronously
     background_tasks.add_task(
         process_order_timeout,
         redis,
