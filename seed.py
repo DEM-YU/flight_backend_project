@@ -16,14 +16,15 @@ import uuid
 from datetime import datetime, timezone
 
 import redis.asyncio as aioredis
-from sqlalchemy import text
+
 
 from database import AsyncSessionLocal, engine, settings
-from models import Base, Flight, Seat
+from models import Base, Flight, Seat, SeatState
 
 # ── Fixed flight_id for compatibility with the stress testing script ──
 FLIGHT_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
 SEAT_COUNT = 30
+SEAT_DB_STATUS_AVAILABLE = 0  # Integer value for seats.status column (0 = available)
 
 
 async def main() -> None:
@@ -55,7 +56,7 @@ async def main() -> None:
                     id=uuid.uuid4(),
                     flight_id=FLIGHT_ID,
                     seat_code=f"{i}A",
-                    status=0,
+                    status=SEAT_DB_STATUS_AVAILABLE,
                 )
                 for i in range(1, SEAT_COUNT + 1)
             ]
@@ -68,7 +69,7 @@ async def main() -> None:
     seat_key = f"flight:{FLIGHT_ID}:seats"
 
     # Batch write: HSET flight:<id>:seats 1A 0 2A 0 ... 30A 0
-    seat_map = {f"{i}A": "0" for i in range(1, SEAT_COUNT + 1)}
+    seat_map = {f"{i}A": SeatState.AVAILABLE for i in range(1, SEAT_COUNT + 1)}
     await redis.hset(seat_key, mapping=seat_map)
     await redis.aclose()
     print(f"✅ Seeded {SEAT_COUNT} seat statuses in Redis Hash [{seat_key}]")
