@@ -63,5 +63,3 @@ async def get_redis() -> AsyncGenerator[aioredis.Redis, None]:
         yield client
     finally:
         await client.aclose()
-
-    
