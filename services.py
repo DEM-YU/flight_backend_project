@@ -32,7 +32,6 @@ else
     return 0
 end
 """
-
 def _cache_key(departure: str, arrival: str, date_str: str) -> str:
     return f"route:{departure}:{arrival}:{date_str}"
 
@@ -109,3 +108,35 @@ async def reserve_seat(
     await db.commit()
     await db.refresh(order)
     return order
+
+
+async def process_order_timeout(
+    redis: aioredis.Redis,
+    order_id: str,
+    flight_id: str,
+    seat_code: str,
+    delay: int = 60,
+) -> None:
+    """Background task: auto-cancel unpaid orders after the payment window expires."""
+    # TODO: replace with a durable job queue (Celery / pg-based outbox) so
+    # timeouts survive process restarts. In-process sleep is a pragmatic
+    # starting point but loses tasks on crash.
+
+    # 1. Wait for payment window
+    await asyncio.sleep(delay)
+
+    # 2. Check order status in an isolated session
+    async with AsyncSessionLocal() as db:
+
+        order = (
+            await db.execute(select(Order).where(Order.id == UUID(order_id)))
+        ).scalar_one_or_none()
+
+        if order is None or order.status != "Pending":
+            return
+
+        order.status = "Cancelled"
+        await db.commit()
+
+    # Step D: Cache rollback and inventory replenishment back to ticket pool
+    await redis.hset(f"flight:{flight_id}:seats", seat_code, "0")
