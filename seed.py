@@ -8,10 +8,14 @@ import redis.asyncio as aioredis
 from sqlalchemy import select
 
 from database import AsyncSessionLocal, engine, settings
-from models import Base, Flight, Seat, SeatState
+from models import Base, Flight, Seat, SeatState, User
+from auth import hash_password
 
 
 FLIGHT_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
+USER_ID = uuid.UUID("00000000-0000-0000-0000-000000000002")
+USER_EMAIL = "test@example.com"
+USER_PASSWORD = "password123"
 SEAT_COUNT = 30
 SEAT_DB_STATUS_AVAILABLE = 0
 
@@ -22,6 +26,21 @@ async def main() -> None:
     print("[INFO] Tables created.")
 
     async with AsyncSessionLocal() as db:
+        # Check and seed test user
+        existing_user = await db.execute(select(User).where(User.id == USER_ID))
+        if existing_user.scalar_one_or_none():
+            print("[WARN] Test user already exists, skipping user seed.")
+        else:
+            hashed_pw = hash_password(USER_PASSWORD)
+            test_user = User(
+                id=USER_ID,
+                email=USER_EMAIL,
+                hashed_password=hashed_pw,
+            )
+            db.add(test_user)
+            await db.commit()
+            print(f"[INFO] Test user {USER_EMAIL} inserted.")
+
         existing = await db.execute(select(Flight).where(Flight.id == FLIGHT_ID))
         if existing.scalar_one_or_none():
             print("[WARN] Test flight already exists, skipping.")

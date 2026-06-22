@@ -11,6 +11,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api import router
+from auth_api import router as auth_router
 from database import engine, get_db, get_redis, redis_pool
 from models import Base
 
@@ -85,4 +86,5 @@ async def health_check(
     return status
 
 
+app.include_router(auth_router)
 app.include_router(router)

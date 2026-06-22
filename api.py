@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db, get_redis
 from models import FlightResponse, OrderResponse, ReserveRequest
+from auth import get_current_user_id
 from services import (
     SeatNotFoundException,
     SeatUnavailableException,
@@ -44,13 +45,12 @@ async def reserve_flight_seat(
     background_tasks: BackgroundTasks,
     db: Annotated[AsyncSession, Depends(get_db)],
     redis: Annotated[aioredis.Redis, Depends(get_redis)],
+    user_id: Annotated[uuid.UUID, Depends(get_current_user_id)],
 ) -> OrderResponse:
     """Reserve a seat atomically and schedule a background payment timeout."""
-    # In production this comes from JWT middleware.
-    mock_user_id = uuid.uuid4()
     try:
         order = await reserve_seat(
-            db, redis, mock_user_id, payload.flight_id, payload.seat_code
+            db, redis, user_id, payload.flight_id, payload.seat_code
         )
     except SeatNotFoundException:
         raise HTTPException(

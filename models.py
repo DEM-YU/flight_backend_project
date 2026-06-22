@@ -27,6 +27,21 @@ class Base(DeclarativeBase):
     pass
 
 
+class User(Base):
+    """User accounts table storing email and bcrypt-hashed password."""
+    __tablename__ = "users"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    email: Mapped[str] = mapped_column(
+        String(255), unique=True, nullable=False, index=True
+    )
+    hashed_password: Mapped[str] = mapped_column(
+        String(255), nullable=False
+    )
+
+
 class Flight(Base):
     """Scheduled flight with a compound index on (departure, arrival) for route lookups."""
     __tablename__ = "flights"
@@ -70,7 +85,9 @@ class Order(Base):
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
-    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
     flight_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("flights.id", ondelete="RESTRICT"), nullable=False
     )
@@ -113,3 +130,28 @@ class OrderResponse(BaseModel):
     seat_code: str
     status: str
     created_at: datetime
+
+
+class RegisterRequest(BaseModel):
+    email: str
+    password: str
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+
+
+class LogoutRequest(BaseModel):
+    refresh_token: str
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
