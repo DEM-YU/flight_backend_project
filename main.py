@@ -11,7 +11,7 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api import router
-from database import engine, get_db, get_redis
+from database import engine, get_db, get_redis, redis_pool
 from models import Base
 
 logger = logging.getLogger(__name__)
@@ -19,11 +19,12 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Create tables on startup, dispose engine on shutdown."""
+    """Create tables on startup, dispose engine and Redis pool on shutdown."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     yield
     await engine.dispose()
+    await redis_pool.aclose()
 
 
 

@@ -5,9 +5,9 @@ services:
     ports:
       - "5432:5432"
     environment:
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=postgres
-      - POSTGRES_DB=postgres
+      - POSTGRES_USER=flight_user
+      - POSTGRES_PASSWORD=flight_pass
+      - POSTGRES_DB=flight_db
   
   redis:
     image: redis:7-alpine
