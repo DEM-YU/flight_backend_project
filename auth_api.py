@@ -1,4 +1,5 @@
 from typing import Annotated
+import uuid
 import redis.asyncio as aioredis
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
@@ -117,5 +118,5 @@ async def refresh(
             detail="Refresh token has been invalidated or expired."
         )
 
-    new_access_token = create_access_token(user_id_str)
+    new_access_token = create_access_token(uuid.UUID(user_id_str))
     return {"access_token": new_access_token, "token_type": "bearer"}
