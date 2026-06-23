@@ -25,9 +25,7 @@ from services import (
     search_flights,
 )
 
-# ---------------------------------------------------------------------------
 # pytest-asyncio configuration
-# ---------------------------------------------------------------------------
 pytestmark = pytest.mark.asyncio
 
 
