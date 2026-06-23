@@ -7,7 +7,7 @@ from collections import Counter
 import aiohttp
 
 
-BASE_URL    = "http://localhost:8080"
+BASE_URL    = "http://localhost:8000"
 URL         = f"{BASE_URL}/api/v1/orders/reserve"
 
 FLIGHT_ID   = "00000000-0000-0000-0000-000000000001"
