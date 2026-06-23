@@ -22,9 +22,7 @@ from collections import Counter
 
 import aiohttp
 
-# ---------------------------------------------------------------------------
 # Defaults
-# ---------------------------------------------------------------------------
 BASE_URL    = "http://127.0.0.1:8000"
 FLIGHT_ID   = "00000000-0000-0000-0000-000000000001"
 SEAT_CODE   = "1A"
@@ -38,9 +36,7 @@ LOGIN_EMAIL    = "test@example.com"
 LOGIN_PASSWORD = "password123"
 
 
-# ---------------------------------------------------------------------------
 # Helpers
-# ---------------------------------------------------------------------------
 async def check_server() -> bool:
     """Return True if the server is reachable."""
     try:
@@ -114,9 +110,7 @@ async def reserve(
         return "exception"
 
 
-# ---------------------------------------------------------------------------
 # Main
-# ---------------------------------------------------------------------------
 async def main(concurrency: int, seat_code: str, flight_id: str, reset: bool) -> None:
     print("=" * 60)
     print("  Flight Seat Reservation — Stress Test")
