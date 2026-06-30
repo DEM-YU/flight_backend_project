@@ -13,7 +13,6 @@ class Settings(BaseSettings):
     POSTGRES_PORT: int = 5432
     POSTGRES_DB: str = "flight_db"
 
-
     REDIS_URL: str = "redis://localhost:6379"
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
@@ -64,5 +63,3 @@ async def get_redis() -> AsyncGenerator[aioredis.Redis, None]:
         yield client
     finally:
         await client.aclose()
-
-    

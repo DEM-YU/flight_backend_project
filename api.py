@@ -33,7 +33,6 @@ async def list_flights(
         db, redis, departure.strip().upper(), arrival.strip().upper(), travel_date,
     )
 
-
     response.headers["X-Cache-Status"] = "HIT" if is_from_cache else "MISS"
 
     return flights
@@ -63,7 +62,6 @@ async def reserve_flight_seat(
             status_code=409,
             detail="Seat is already reserved or unavailable.",
         )
-
 
     background_tasks.add_task(
         process_order_timeout,

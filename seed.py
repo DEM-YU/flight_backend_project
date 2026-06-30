@@ -1,7 +1,5 @@
 
 
-
-
 import asyncio
 import uuid
 from datetime import datetime, timezone
@@ -19,19 +17,16 @@ SEAT_DB_STATUS_AVAILABLE = 0
 
 
 async def main() -> None:
-
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     print("[INFO] Tables created.")
 
     async with AsyncSessionLocal() as db:
-
         from sqlalchemy import select
         existing = await db.execute(select(Flight).where(Flight.id == FLIGHT_ID))
         if existing.scalar_one_or_none():
             print("[WARN] Test flight already exists, skipping.")
         else:
-
             flight = Flight(
                 id=FLIGHT_ID,
                 flight_num="TEST-001",
@@ -40,7 +35,6 @@ async def main() -> None:
                 departure_time=datetime(2026, 6, 1, 8, 0, tzinfo=timezone.utc),
             )
             db.add(flight)
-
 
             seats = [
                 Seat(
@@ -55,10 +49,8 @@ async def main() -> None:
             await db.commit()
             print(f"[INFO] Flight {FLIGHT_ID} and {SEAT_COUNT} seats inserted.")
 
-
     redis = aioredis.Redis.from_url(settings.REDIS_URL, decode_responses=True)
     seat_key = f"flight:{FLIGHT_ID}:seats"
-
 
     seat_map = {f"{i}A": SeatState.AVAILABLE for i in range(1, SEAT_COUNT + 1)}
     await redis.hset(seat_key, mapping=seat_map)

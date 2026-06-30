@@ -50,7 +50,6 @@ end
 
 
 def _cache_key(departure: str, arrival: str, date_str: str) -> str:
-
     return f"route:{departure.upper()}:{arrival.upper()}:{date_str}"
 
 
@@ -138,7 +137,6 @@ async def reserve_seat(
         )
         return order
     except Exception:
-
         logger.error(
             "DB commit failed for seat %s on flight %s, rolling back Redis lock",
             seat_code, flight_id, exc_info=True,
@@ -165,19 +163,18 @@ async def process_order_timeout(
 
     # 2. Check order status in an isolated session
     async with AsyncSessionLocal() as db:
-
         order = (
             await db.execute(select(Order).where(Order.id == UUID(order_id)))
         ).scalar_one_or_none()
 
         if order is None or order.status != OrderStatus.PENDING:
-
             logger.info(
                 "Order %s timeout check: status=%s, no action needed",
                 order_id, order.status if order else "NOT_FOUND",
             )
             return
 
+        # 3. Cancel the order
         order.status = OrderStatus.CANCELLED
         await db.commit()
         logger.info("Order %s auto-cancelled after %ds timeout", order_id, delay)

@@ -1,7 +1,5 @@
 
 
-
-
 import asyncio
 import uuid
 from collections import Counter
@@ -12,11 +10,9 @@ import aiohttp
 BASE_URL    = "http://localhost:8080"
 URL         = f"{BASE_URL}/api/v1/orders/reserve"
 
-
 FLIGHT_ID   = "00000000-0000-0000-0000-000000000001"
 SEAT_CODE   = "1A"
 CONCURRENCY = 30
-
 
 
 
@@ -49,7 +45,6 @@ async def main() -> None:
     async with aiohttp.ClientSession(connector=connector) as session:
         tasks = [reserve(session, i) for i in range(1, CONCURRENCY + 1)]
         results = await asyncio.gather(*tasks)
-
 
     counts = Counter(results)
     print()

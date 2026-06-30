@@ -17,9 +17,9 @@ from models import Base
 logger = logging.getLogger(__name__)
 
 
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """Create tables on startup, dispose engine on shutdown."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     yield
@@ -35,9 +35,9 @@ app = FastAPI(
 )
 
 
-
 @app.exception_handler(OperationalError)
 async def db_exception_handler(request: Request, exc: OperationalError) -> JSONResponse:
+
     logger.error("Database operational error on %s: %s", request.url.path, exc, exc_info=True)
     return JSONResponse(
         status_code=503,
@@ -47,12 +47,12 @@ async def db_exception_handler(request: Request, exc: OperationalError) -> JSONR
 
 @app.exception_handler(RedisConnectionError)
 async def redis_exception_handler(request: Request, exc: RedisConnectionError) -> JSONResponse:
+
     logger.error("Redis connection error on %s: %s", request.url.path, exc, exc_info=True)
     return JSONResponse(
         status_code=503,
         content={"detail": "Service temporarily unavailable. Please retry."},
     )
-
 
 
 @app.get("/health", tags=["Infrastructure"])
