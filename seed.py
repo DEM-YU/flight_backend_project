@@ -2,10 +2,10 @@
 
 import asyncio
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import redis.asyncio as aioredis
-
+from sqlalchemy import select
 
 from database import AsyncSessionLocal, engine, settings
 from models import Base, Flight, Seat, SeatState
@@ -22,7 +22,6 @@ async def main() -> None:
     print("[INFO] Tables created.")
 
     async with AsyncSessionLocal() as db:
-        from sqlalchemy import select
         existing = await db.execute(select(Flight).where(Flight.id == FLIGHT_ID))
         if existing.scalar_one_or_none():
             print("[WARN] Test flight already exists, skipping.")
@@ -32,7 +31,8 @@ async def main() -> None:
                 flight_num="TEST-001",
                 departure="PEK",
                 arrival="SHA",
-                departure_time=datetime(2026, 6, 1, 8, 0, tzinfo=timezone.utc),
+                # Dynamically set 30 days from now so the flight is always in the future.
+                departure_time=datetime.now(timezone.utc) + timedelta(days=30),
             )
             db.add(flight)
 
