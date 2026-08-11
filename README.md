@@ -1,6 +1,6 @@
 # Flight Booking Backend
 
-A production-ready transatlantic flight search & seat booking backend engine. Engineered with **FastAPI**, **PostgreSQL**, and **Redis** to solve the dual challenges of high-concurrency seat reservation (overselling prevention) and low-latency cache queries, backed by a robust JWT authentication system.
+A flight search and seat reservation backend built with **FastAPI**, **PostgreSQL**, and **Redis**. Focuses on atomic seat reservations to prevent overselling under concurrent load, cache-aside querying, and JWT authentication with Redis-backed session revocation.
 
 ---
 
@@ -136,7 +136,7 @@ Here is a curated directory layout explaining the core logic files:
 | :--- | :--- | :--- | :--- |
 | **POST** | `/api/v1/auth/register` | Register a new user account | None |
 | **POST** | `/api/v1/auth/login` | Authenticate and return Access + Refresh Token | None |
-| **POST** | `/api/v1/auth/logout` | Revoke user session and delete Refresh Token from Redis | None |
+| **POST** | `/api/v1/auth/logout` | Revoke user session and delete Refresh Token from Redis | **Refresh Token** |
 | **POST** | `/api/v1/auth/refresh` | Reissue Access Token using a valid Refresh Token | None |
 | **GET** | `/api/v1/flights` | Search flights (Cache-Aside, returns `X-Cache-Status` header) | None |
 | **POST** | `/api/v1/orders/reserve` | Reserve seat atomically (Returns order details, schedules timeout) | **JWT Access Token** |
@@ -166,8 +166,8 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 4. Seed Development Data & Run the Server
-Seed 10,000+ mock flights, initialize seat grids in Redis, and spin up the development server:
+### 4. Seed Data & Start the Server
+Seed a test flight with 30 seats and start the development server:
 ```bash
 python seed.py
 uvicorn main:app --host 0.0.0.0 --port 8080 --reload
