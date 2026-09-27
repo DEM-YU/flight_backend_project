@@ -16,8 +16,6 @@ from services import (
 )
 
 
-
-
 pytestmark = pytest.mark.asyncio
 
 

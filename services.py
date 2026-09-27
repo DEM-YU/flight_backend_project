@@ -11,7 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import AsyncSessionLocal
-from models import FlightResponse, OrderStatus, SeatState, Flight, Order
+from models import FlightResponse, OrderStatus, SeatState, Flight, Order, Seat
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +31,18 @@ class SeatUnavailableException(Exception):
 
 
 class SeatNotFoundException(Exception):
+    pass
+
+
+class OrderNotFoundException(Exception):
+    pass
+
+
+class OrderForbiddenException(Exception):
+    pass
+
+
+class InvalidOrderStatusException(Exception):
     pass
 
 
@@ -205,3 +217,40 @@ async def process_order_timeout(
         "is cancelled in DB. Manual intervention required.",
         seat_code, flight_id, order_id,
     )
+
+
+async def pay_order(
+    db: AsyncSession,
+    order_id: UUID,
+    user_id: UUID,
+) -> Order:
+    order = (
+        await db.execute(select(Order).where(Order.id == order_id))
+    ).scalar_one_or_none()
+
+    if order is None:
+        raise OrderNotFoundException(f"Order {order_id} not found.")
+
+    if order.user_id != user_id:
+        raise OrderForbiddenException("You do not have permission to pay for this order.")
+
+    if order.status != OrderStatus.PENDING:
+        raise InvalidOrderStatusException(
+            f"Order {order_id} cannot be paid. Current status: {order.status}."
+        )
+
+    order.status = OrderStatus.CONFIRMED
+
+
+    seat_stmt = select(Seat).where(
+        Seat.flight_id == order.flight_id,
+        Seat.seat_code == order.seat_code,
+    )
+    seat = (await db.execute(seat_stmt)).scalar_one_or_none()
+    if seat:
+        seat.status = 1
+
+    await db.commit()
+    await db.refresh(order)
+    logger.info("Order %s confirmed and paid by user %s", order_id, user_id)
+    return order
