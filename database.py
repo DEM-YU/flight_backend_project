@@ -20,6 +20,9 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
 
+    RATE_LIMIT_RESERVE_TIMES: int = 10
+    RATE_LIMIT_RESERVE_SECONDS: int = 10
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     @property

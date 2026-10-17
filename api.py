@@ -6,9 +6,10 @@ import redis.asyncio as aioredis
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from database import get_db, get_redis
+from database import get_db, get_redis, settings
 from models import FlightResponse, OrderResponse, ReserveRequest
 from auth import get_current_user_id
+from rate_limiter import RateLimiter
 from services import (
     InvalidOrderStatusException,
     OrderForbiddenException,
@@ -22,6 +23,11 @@ from services import (
 )
 
 router = APIRouter(prefix="/api/v1", tags=["Flights"])
+
+reserve_limiter = RateLimiter(
+    times=settings.RATE_LIMIT_RESERVE_TIMES,
+    seconds=settings.RATE_LIMIT_RESERVE_SECONDS,
+)
 
 
 @router.get("/flights", response_model=list[FlightResponse])
@@ -43,7 +49,12 @@ async def list_flights(
     return flights
 
 
-@router.post("/orders/reserve", response_model=OrderResponse, status_code=201)
+@router.post(
+    "/orders/reserve",
+    response_model=OrderResponse,
+    status_code=201,
+    dependencies=[Depends(reserve_limiter)],
+)
 async def reserve_flight_seat(
     req: ReserveRequest,
     db: Annotated[AsyncSession, Depends(get_db)],
