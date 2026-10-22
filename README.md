@@ -109,6 +109,10 @@ graph TD
 * **Token Pair:** Login issues a short-lived Access Token (15 minutes) and a long-lived Refresh Token (7 days).
 * **Revocation via Redis:** Refresh tokens are stored in Redis (`refresh_token:<token>`). Calling `/auth/logout` deletes the key from Redis. During token refresh, the endpoint validates both the JWT signature and its existence in Redis, allowing active revocation before token expiry.
 
+### 5. Sliding-Window Rate Limiting
+* Protects `/orders/reserve` against rapid-fire requests using a Redis ZSet sliding-window script.
+* Identifies clients by JWT user ID or client IP, returning HTTP 429 with `Retry-After` headers when limits are exceeded.
+
 ---
 
 ## 📂 Project Directory Structure
@@ -120,6 +124,7 @@ Here is a curated directory layout explaining the core logic files:
     *   📄 [api.py](file:///Users/brooks/github/flight_backend_project/api.py): Flight search and seat reservation routes.
     *   📄 [auth_api.py](file:///Users/brooks/github/flight_backend_project/auth_api.py): User registration, login, logout, and token refresh endpoints.
     *   📄 [services.py](file:///Users/brooks/github/flight_backend_project/services.py): Central core service layer (Lua scripts execution, Cache-aside logic, compensating rollback, background timeout cancellation).
+    *   📄 [rate_limiter.py](file:///Users/brooks/github/flight_backend_project/rate_limiter.py): Distributed sliding-window rate limiting dependency via Redis ZSet.
     *   📄 [models.py](file:///Users/brooks/github/flight_backend_project/models.py): SQLAlchemy models (users, flights, seats, orders) and Pydantic schemas.
     *   📄 [auth.py](file:///Users/brooks/github/flight_backend_project/auth.py): Password hashing (bcrypt) and JWT encode/decode helper functions.
     *   📄 [database.py](file:///Users/brooks/github/flight_backend_project/database.py): Asynchronous DB engines, session makers, Redis clients, and environment settings.
@@ -128,6 +133,7 @@ Here is a curated directory layout explaining the core logic files:
     *   📂 **`tests/`**
         *   📄 [test_auth.py](file:///Users/brooks/github/flight_backend_project/tests/test_auth.py): Integration tests validating user sign-up, dual-token generation, refresh, and logout.
         *   📄 [test_services.py](file:///Users/brooks/github/flight_backend_project/tests/test_services.py): Unit tests for flight queries, Lua locking mechanism, and timeout cancellations.
+        *   📄 [test_rate_limiter.py](file:///Users/brooks/github/flight_backend_project/tests/test_rate_limiter.py): Unit and integration tests for sliding window rate limiting and RFC 6585 headers.
 
 ---
 
