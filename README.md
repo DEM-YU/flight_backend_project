@@ -178,9 +178,9 @@ pip install -r requirements.txt
 Seed a test flight with 30 seats and start the development server:
 ```bash
 python seed.py
-uvicorn main:app --host 0.0.0.0 --port 8080 --reload
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
-*   **Interactive API Docs**: `http://localhost:8080/docs`
+* Interactive API Docs: `http://localhost:8000/docs`
 
 ### 5. Run Tests
 ```bash

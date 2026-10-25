@@ -28,29 +28,25 @@ FLIGHT_ID   = "00000000-0000-0000-0000-000000000001"
 SEAT_CODE   = "1A"
 CONCURRENCY = 30
 
-LOGIN_URL   = f"{BASE_URL}/api/v1/auth/login"
-RESERVE_URL = f"{BASE_URL}/api/v1/orders/reserve"
-HEALTH_URL  = f"{BASE_URL}/health"
-
 LOGIN_EMAIL    = "test@example.com"
 LOGIN_PASSWORD = "password123"
 
 
 
-async def check_server() -> bool:
+async def check_server(base_url: str = BASE_URL) -> bool:
 
     try:
         async with aiohttp.ClientSession() as s:
-            async with s.get(HEALTH_URL, timeout=aiohttp.ClientTimeout(total=3)) as r:
+            async with s.get(f"{base_url}/health", timeout=aiohttp.ClientTimeout(total=3)) as r:
                 return r.status in (200, 503)
     except Exception:
         return False
 
 
-async def login(session: aiohttp.ClientSession) -> str | None:
+async def login(session: aiohttp.ClientSession, base_url: str = BASE_URL) -> str | None:
     login_data = {"email": LOGIN_EMAIL, "password": LOGIN_PASSWORD}
     try:
-        async with session.post(LOGIN_URL, json=payload) as resp:
+        async with session.post(f"{base_url}/api/v1/auth/login", json=login_data) as resp:
             if resp.status == 200:
                 body = await resp.json()
                 return body["access_token"]
@@ -84,9 +80,10 @@ async def reserve(
     headers: dict,
     flight_id: str,
     seat_code: str,
+    base_url: str = BASE_URL,
 ) -> str:
 
-    url = RESERVE_URL
+    url = f"{base_url}/api/v1/orders/reserve"
     reserve_body = {"flight_id": flight_id, "seat_code": seat_code}
     try:
         async with session.post(url, json=reserve_body, headers=headers) as resp:
@@ -110,11 +107,12 @@ async def reserve(
 
 
 # Main
-async def main(concurrency: int, seat_code: str, flight_id: str, reset: bool) -> None:
+async def main(concurrency: int, seat_code: str, flight_id: str, reset: bool, base_url: str = BASE_URL) -> None:
+    base_url = base_url.rstrip("/")
     print("=" * 60)
     print("  Flight Seat Reservation — Stress Test")
     print("=" * 60)
-    print(f"  Server:      {BASE_URL}")
+    print(f"  Server:      {base_url}")
     print(f"  Flight ID:   {flight_id}")
     print(f"  Seat Code:   {seat_code}")
     print(f"  Concurrency: {concurrency}")
@@ -123,9 +121,9 @@ async def main(concurrency: int, seat_code: str, flight_id: str, reset: bool) ->
 
 
     print("\n[1/4] Checking server availability ...")
-    alive = await check_server()
+    alive = await check_server(base_url)
     if not alive:
-        print("\n  ERROR: Server is not reachable at", BASE_URL)
+        print("\n  ERROR: Server is not reachable at", base_url)
         print("  Please start the server first:")
         print("    uvicorn main:app --reload")
         print()
@@ -143,7 +141,7 @@ async def main(concurrency: int, seat_code: str, flight_id: str, reset: bool) ->
 
     print("[3/4] Logging in as test user ...")
     async with aiohttp.ClientSession() as login_session:
-        token = await login(login_session)
+        token = await login(login_session, base_url)
     if not token:
         print("\n  ERROR: Could not obtain access token. Aborting.")
         print("  Make sure you ran: python seed.py")
@@ -157,7 +155,7 @@ async def main(concurrency: int, seat_code: str, flight_id: str, reset: bool) ->
     connector = aiohttp.TCPConnector(limit=concurrency)
     async with aiohttp.ClientSession(connector=connector) as session:
         tasks = [
-            reserve(session, i, headers, flight_id, seat_code)
+            reserve(session, i, headers, flight_id, seat_code, base_url)
             for i in range(1, concurrency + 1)
         ]
         results = await asyncio.gather(*tasks)
@@ -190,6 +188,8 @@ def parse_args() -> argparse.Namespace:
                         help=f"Seat code to test (default: {SEAT_CODE})")
     parser.add_argument("-f", "--flight", type=str, default=FLIGHT_ID,
                         help=f"Flight UUID (default: {FLIGHT_ID})")
+    parser.add_argument("-u", "--url", type=str, default=BASE_URL,
+                        help=f"Base URL of backend (default: {BASE_URL})")
     parser.add_argument("--reset", action="store_true",
                         help="Reset the seat in Redis before testing (makes test repeatable)")
     return parser.parse_args()
@@ -197,4 +197,4 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_args()
-    asyncio.run(main(args.concurrency, args.seat, args.flight, args.reset))
+    asyncio.run(main(args.concurrency, args.seat, args.flight, args.reset, args.url))

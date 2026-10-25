@@ -243,9 +243,7 @@ class TestProcessOrderTimeout:
 
 
 class TestRedisZSetTimeoutQueue:
-
     async def test_schedule_order_timeout(self):
-
         redis = AsyncMock()
         order_id = str(uuid.uuid4())
         flight_id = str(uuid.uuid4())
@@ -263,13 +261,11 @@ class TestRedisZSetTimeoutQueue:
         assert payload["seat_code"] == seat_code
 
     async def test_process_expired_orders(self):
-
         redis = AsyncMock()
         order_id = str(uuid.uuid4())
         flight_id = str(uuid.uuid4())
         seat_code = "8E"
         raw_payload = json.dumps({"order_id": order_id, "flight_id": flight_id, "seat_code": seat_code})
-
 
         redis.eval.return_value = [raw_payload]
 
@@ -279,7 +275,6 @@ class TestRedisZSetTimeoutQueue:
             mock_cancel.assert_called_once_with(redis, order_id, flight_id, seat_code)
 
     async def test_process_expired_orders_empty(self):
-
         redis = AsyncMock()
         redis.eval.return_value = []
 
@@ -287,11 +282,8 @@ class TestRedisZSetTimeoutQueue:
         assert count == 0
 
 
-
 class TestPayOrder:
-
     async def test_pay_order_success(self):
-
         db = AsyncMock()
         order_id = uuid.uuid4()
         user_id = uuid.uuid4()
@@ -307,7 +299,6 @@ class TestPayOrder:
 
         mock_seat = MagicMock()
         mock_seat.status = 0
-
 
         order_exec_result = MagicMock()
         order_exec_result.scalar_one_or_none.return_value = mock_order
@@ -325,7 +316,6 @@ class TestPayOrder:
         db.refresh.assert_called_once_with(mock_order)
 
     async def test_pay_order_not_found_raises(self):
-
         db = AsyncMock()
         order_exec_result = MagicMock()
         order_exec_result.scalar_one_or_none.return_value = None
@@ -335,7 +325,6 @@ class TestPayOrder:
             await pay_order(db, uuid.uuid4(), uuid.uuid4())
 
     async def test_pay_order_forbidden_for_other_user(self):
-
         db = AsyncMock()
         owner_id = uuid.uuid4()
         different_user_id = uuid.uuid4()
@@ -350,7 +339,6 @@ class TestPayOrder:
             await pay_order(db, uuid.uuid4(), different_user_id)
 
     async def test_pay_order_already_cancelled_raises(self):
-
         db = AsyncMock()
         user_id = uuid.uuid4()
 
@@ -365,7 +353,6 @@ class TestPayOrder:
             await pay_order(db, uuid.uuid4(), user_id)
 
     async def test_pay_order_already_confirmed_raises(self):
-
         db = AsyncMock()
         user_id = uuid.uuid4()
 
@@ -381,7 +368,6 @@ class TestPayOrder:
 
 
 class TestPayOrderAPI:
-
     async def test_pay_endpoint_success(self):
         from httpx import AsyncClient, ASGITransport
         from main import app

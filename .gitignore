@@ -9,4 +9,5 @@ env/
 # Byte-compiled / cache files
 __pycache__/
 *.pyc
+.pytest_cache/
 .DS_Store

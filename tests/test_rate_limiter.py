@@ -8,18 +8,14 @@ from httpx import ASGITransport, AsyncClient
 
 from database import get_db, get_redis, settings
 from main import app
-
 from rate_limiter import RateLimiter, SLIDING_WINDOW_SCRIPT
 
 pytestmark = pytest.mark.asyncio
 
 
 class TestRateLimiterUnit:
-
     async def test_rate_limiter_allows_request_when_under_limit(self):
-
         redis = AsyncMock()
-
         redis.eval.return_value = [1, 4, 0]
 
         limiter = RateLimiter(times=5, seconds=10)
@@ -27,7 +23,6 @@ class TestRateLimiterUnit:
         request.headers = {}
         request.client = MagicMock(host="192.168.1.100")
         request.url = MagicMock(path="/api/v1/orders/reserve")
-
 
         await limiter(request, redis)
 
@@ -41,7 +36,6 @@ class TestRateLimiterUnit:
 
     async def test_rate_limiter_blocks_when_limit_exceeded(self):
         redis = AsyncMock()
-
         redis.eval.return_value = [0, 0, 6]
 
         limiter = RateLimiter(times=5, seconds=10)
@@ -55,13 +49,11 @@ class TestRateLimiterUnit:
 
         exc = exc_info.value
         assert exc.status_code == status.HTTP_429_TOO_MANY_REQUESTS
-
         assert exc.headers["Retry-After"] == "6"
         assert exc.headers["X-RateLimit-Limit"] == "5"
         assert exc.headers["X-RateLimit-Remaining"] == "0"
 
     async def test_extract_identifier_authenticated_user(self):
-
         limiter = RateLimiter(times=5, seconds=10)
         user_id = str(uuid.uuid4())
         token = jwt.encode(
@@ -78,7 +70,6 @@ class TestRateLimiterUnit:
         assert ident == f"user:{user_id}"
 
     async def test_extract_identifier_anonymous_falls_back_to_ip(self):
-
         limiter = RateLimiter(times=5, seconds=10)
         request = MagicMock(spec=Request)
         request.headers = {}
@@ -91,7 +82,6 @@ class TestRateLimiterUnit:
 class TestRateLimiterIntegration:
     async def test_reserve_endpoint_blocked_by_rate_limiter(self):
         redis_mock = AsyncMock()
-
         redis_mock.eval.return_value = [0, 0, 9]
 
         db_mock = MagicMock()
@@ -115,7 +105,6 @@ class TestRateLimiterIntegration:
                 resp = await ac.post("/api/v1/orders/reserve", json=payload, headers=headers)
 
                 assert resp.status_code == 429
-
                 assert resp.headers["Retry-After"] == "9"
                 assert resp.headers["X-RateLimit-Limit"] == str(settings.RATE_LIMIT_RESERVE_TIMES)
                 assert resp.headers["X-RateLimit-Remaining"] == "0"

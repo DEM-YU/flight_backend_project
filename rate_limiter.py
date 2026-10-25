@@ -8,7 +8,6 @@ from fastapi import Depends, HTTPException, Request, status
 
 from database import get_redis, settings
 
-
 SLIDING_WINDOW_SCRIPT = """
 local key = KEYS[1]
 local now = tonumber(ARGV[1])
@@ -16,19 +15,14 @@ local window = tonumber(ARGV[2])
 local limit = tonumber(ARGV[3])
 local member = ARGV[4]
 
--- 1. Evict request entries that fall outside the current sliding window
 redis.call('ZREMRANGEBYSCORE', key, '-inf', now - window)
--- 2. Count requests remaining in the sliding window
 local current_count = redis.call('ZCARD', key)
 
 if current_count < limit then
-
     redis.call('ZADD', key, now, member)
-
     redis.call('EXPIRE', key, math.ceil(window))
     return {1, limit - (current_count + 1), 0}
 else
-
     local oldest = redis.call('ZRANGE', key, 0, 0, 'WITHSCORES')
     local retry_after = 1
     if #oldest >= 2 then
@@ -40,14 +34,12 @@ end
 
 
 class RateLimiter:
-
     def __init__(self, times: int = 5, seconds: int = 10, key_prefix: str = "rate_limit"):
         self.times = times
         self.seconds = seconds
         self.key_prefix = key_prefix
 
     def _extract_identifier(self, request: Request) -> str:
-
         auth_header = request.headers.get("Authorization")
         if auth_header and auth_header.startswith("Bearer "):
             token = auth_header.split(" ", 1)[1]
@@ -85,9 +77,8 @@ class RateLimiter:
             member,
         )
 
-        allowed = bool(result[0])
-
-        retry_after = int(result[2])
+        allowed = bool(limiter_res[0])
+        retry_after = int(limiter_res[2])
 
         if not allowed:
             raise HTTPException(

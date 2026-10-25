@@ -25,7 +25,6 @@ _SEAT_RELEASE_MAX_RETRIES = 3
 
 ORDER_TIMEOUT_QUEUE_KEY = "order:timeout:zset"
 
-
 ZPOPMIN_BY_SCORE_SCRIPT = """
 local items = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, ARGV[2])
 if #items > 0 then
@@ -206,11 +205,9 @@ async def cancel_expired_order(
             )
             return False
 
-
         order.status = OrderStatus.CANCELLED
         await db.commit()
         logger.info("Order %s auto-cancelled by timeout worker", order_id)
-
 
     seat_key = f"flight:{flight_id}:seats"
     for attempt in range(_SEAT_RELEASE_MAX_RETRIES):
@@ -229,7 +226,6 @@ async def cancel_expired_order(
             )
             if attempt < _SEAT_RELEASE_MAX_RETRIES - 1:
                 await asyncio.sleep(1 * (attempt + 1))
-
 
     logger.critical(
         "GHOST LOCK: Seat %s on flight %s is locked in Redis but order %s "
@@ -317,7 +313,6 @@ async def pay_order(
         )
 
     order.status = OrderStatus.CONFIRMED
-
 
     seat_stmt = select(Seat).where(
         Seat.flight_id == order.flight_id,
