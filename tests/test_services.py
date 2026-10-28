@@ -1,4 +1,3 @@
-
 import json
 import uuid
 from datetime import date, datetime, timezone
@@ -23,9 +22,7 @@ from services import (
     search_flights,
 )
 
-
 pytestmark = pytest.mark.asyncio
-
 
 
 def _flight_dict(**overrides) -> dict:
@@ -39,14 +36,10 @@ def _flight_dict(**overrides) -> dict:
     return {**defaults, **overrides}
 
 
-
 class TestSearchFlights:
-
     async def test_cache_hit_returns_cached_data_without_db_query(self):
-
         db = AsyncMock()
         redis = AsyncMock()
-
 
         cached = [_flight_dict(flight_num="CA001")]
         redis.get.return_value = json.dumps(cached)
@@ -59,11 +52,9 @@ class TestSearchFlights:
         db.execute.assert_not_called()
 
     async def test_cache_miss_queries_db_and_writes_back(self):
-
         db = AsyncMock()
         redis = AsyncMock()
         redis.get.return_value = None
-
 
         mock_flight = MagicMock()
         mock_flight.id = uuid.uuid4()
@@ -84,7 +75,6 @@ class TestSearchFlights:
         redis.setex.assert_called_once()
 
     async def test_empty_result_uses_short_ttl(self):
-
         db = AsyncMock()
         redis = AsyncMock()
         redis.get.return_value = None
@@ -96,16 +86,12 @@ class TestSearchFlights:
         results, _ = await search_flights(db, redis, "PEK", "CAN", date.today())
 
         assert results == []
-
         _, ttl, _ = redis.setex.call_args.args
         assert ttl == 60
 
 
-
 class TestReserveSeat:
-
     async def test_success_creates_pending_order(self):
-
         db = MagicMock()
         db.add = MagicMock()
         db.commit = AsyncMock()
@@ -121,7 +107,6 @@ class TestReserveSeat:
         assert order.status == OrderStatus.PENDING
 
     async def test_seat_already_locked_raises_unavailable(self):
-
         db = MagicMock()
         db.add = MagicMock()
         redis = AsyncMock()
@@ -133,7 +118,6 @@ class TestReserveSeat:
         db.add.assert_not_called()
 
     async def test_seat_not_initialized_raises_not_found(self):
-
         db = MagicMock()
         db.add = MagicMock()
         redis = AsyncMock()
@@ -145,7 +129,6 @@ class TestReserveSeat:
         db.add.assert_not_called()
 
     async def test_db_failure_releases_redis_lock(self):
-
         db = MagicMock()
         db.add = MagicMock()
         db.commit = AsyncMock(side_effect=Exception("connection lost"))
@@ -159,7 +142,6 @@ class TestReserveSeat:
         with pytest.raises(Exception, match="connection lost"):
             await reserve_seat(db, redis, uuid.uuid4(), flight_id, seat_code)
 
-
         redis.hset.assert_called_once_with(
             f"flight:{flight_id}:seats",
             seat_code,
@@ -167,16 +149,12 @@ class TestReserveSeat:
         )
 
 
-
 class TestProcessOrderTimeout:
-
     async def test_pending_order_is_cancelled_and_seat_released(self):
-
         redis = AsyncMock()
         order_id = str(uuid.uuid4())
         flight_id = str(uuid.uuid4())
         seat_code = "5C"
-
 
         mock_order = MagicMock()
         mock_order.status = OrderStatus.PENDING
@@ -200,7 +178,6 @@ class TestProcessOrderTimeout:
         )
 
     async def test_confirmed_order_is_not_touched(self):
-
         redis = AsyncMock()
         order_id = str(uuid.uuid4())
 
@@ -223,7 +200,6 @@ class TestProcessOrderTimeout:
         redis.hset.assert_not_called()
 
     async def test_missing_order_is_handled_gracefully(self):
-
         redis = AsyncMock()
 
         mock_db_result = MagicMock()
@@ -236,7 +212,6 @@ class TestProcessOrderTimeout:
 
         with patch("services.AsyncSessionLocal", return_value=mock_session):
             with patch("asyncio.sleep", new_callable=AsyncMock):
-
                 await process_order_timeout(redis, str(uuid.uuid4()), "f", "1A", delay=0)
 
         redis.hset.assert_not_called()

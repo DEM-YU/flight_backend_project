@@ -7,12 +7,10 @@ from fastapi.security import OAuth2PasswordBearer
 
 from database import settings
 
-
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login", auto_error=False)
 
 
 def hash_password(password: str) -> str:
-
     pwd_bytes = password.encode("utf-8")
     salt = bcrypt.gensalt()
     hashed = bcrypt.hashpw(pwd_bytes, salt)
@@ -20,7 +18,6 @@ def hash_password(password: str) -> str:
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-
     return bcrypt.checkpw(
         plain_password.encode("utf-8"),
         hashed_password.encode("utf-8")
@@ -28,7 +25,6 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
 
 
 def create_access_token(user_id: uuid.UUID) -> str:
-
     expire = datetime.now(timezone.utc) + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
     claims = {
         "sub": str(user_id),
@@ -39,7 +35,6 @@ def create_access_token(user_id: uuid.UUID) -> str:
 
 
 def create_refresh_token(user_id: uuid.UUID) -> str:
-
     expire = datetime.now(timezone.utc) + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS)
     claims = {
         "sub": str(user_id),
@@ -50,7 +45,6 @@ def create_refresh_token(user_id: uuid.UUID) -> str:
 
 
 async def get_current_user_id(token: str = Depends(oauth2_scheme)) -> uuid.UUID:
-
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Invalid or expired access token.",

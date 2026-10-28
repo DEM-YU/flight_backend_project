@@ -32,11 +32,9 @@ def test_token_creation_and_validation():
     access_token = create_access_token(user_id)
     refresh_token = create_refresh_token(user_id)
 
-
     payload = jwt.decode(access_token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
     assert payload["sub"] == str(user_id)
     assert payload["type"] == "access"
-
 
     payload_refresh = jwt.decode(refresh_token, settings.JWT_SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
     assert payload_refresh["sub"] == str(user_id)
@@ -53,11 +51,9 @@ async def test_get_current_user_id_valid():
 
 @pytest.mark.asyncio
 async def test_get_current_user_id_invalid():
-
     with pytest.raises(HTTPException) as exc:
         await get_current_user_id("invalid-token")
     assert exc.value.status_code == status.HTTP_401_UNAUTHORIZED
-
 
     user_id = uuid.uuid4()
     refresh_token = create_refresh_token(user_id)

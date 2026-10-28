@@ -82,16 +82,13 @@ async def search_flights(
     arrival: str,
     travel_date: date,
 ) -> tuple[list[FlightResponse], bool]:
-
     date_str = travel_date.isoformat()
     key = _cache_key(departure, arrival, date_str)
-
 
     cached = await redis.get(key)
     if cached is not None:
         cached_flights = json.loads(cached)
         return [FlightResponse(**f) for f in cached_flights], True
-
 
     day_start = datetime(
         travel_date.year, travel_date.month, travel_date.day,
@@ -108,7 +105,6 @@ async def search_flights(
 
     flights = (await db.execute(stmt)).scalars().all()
     flight_responses = [FlightResponse.model_validate(f) for f in flights]
-
 
     # Jitter avoids thundering-herd on TTL expiry across multiple keys.
     cache_payload = json.dumps([f.model_dump(mode="json") for f in flight_responses])
@@ -128,7 +124,6 @@ async def reserve_seat(
     flight_id: UUID,
     seat_code: str,
 ) -> Order:
-
     seat_key = f"flight:{flight_id}:seats"
 
     lock_status = await redis.eval(RESERVE_SEAT_SCRIPT, 1, seat_key, seat_code)
@@ -175,7 +170,6 @@ async def schedule_order_timeout(
     seat_code: str,
     delay: int = _ORDER_TIMEOUT_SECONDS,
 ) -> None:
-
     expire_at = datetime.now(timezone.utc).timestamp() + delay
     order_task = json.dumps({
         "order_id": order_id,
@@ -192,7 +186,6 @@ async def cancel_expired_order(
     flight_id: str,
     seat_code: str,
 ) -> bool:
-
     async with AsyncSessionLocal() as db:
         order = (
             await db.execute(select(Order).where(Order.id == UUID(order_id)))
@@ -239,7 +232,6 @@ async def process_expired_orders(
     redis: aioredis.Redis,
     batch_size: int = 50,
 ) -> int:
-
     now_ts = datetime.now(timezone.utc).timestamp()
     due_orders = await redis.eval(
         ZPOPMIN_BY_SCORE_SCRIPT, 1, ORDER_TIMEOUT_QUEUE_KEY, now_ts, batch_size
@@ -265,7 +257,6 @@ async def run_timeout_worker(
     redis: aioredis.Redis,
     poll_interval: float = 1.0,
 ) -> None:
-
     logger.info("Started Redis ZSet timeout cancellation worker.")
     try:
         while True:

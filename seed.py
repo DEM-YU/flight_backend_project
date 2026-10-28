@@ -26,7 +26,6 @@ async def main() -> None:
     print("[INFO] Tables created.")
 
     async with AsyncSessionLocal() as db:
-
         existing_user = await db.execute(select(User).where(User.id == USER_ID))
         if existing_user.scalar_one_or_none():
             print("[WARN] Test user already exists, skipping user seed.")

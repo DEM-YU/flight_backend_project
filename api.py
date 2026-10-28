@@ -39,7 +39,6 @@ async def list_flights(
     arrival: Annotated[str, Query(min_length=1, max_length=64)],
     travel_date: Annotated[date, Query(description="Travel date in YYYY-MM-DD format")],
 ) -> list[FlightResponse]:
-
     flights, is_from_cache = await search_flights(
         db, redis, departure.strip().upper(), arrival.strip().upper(), travel_date,
     )
@@ -61,7 +60,6 @@ async def reserve_flight_seat(
     redis: Annotated[aioredis.Redis, Depends(get_redis)],
     user_id: Annotated[uuid.UUID, Depends(get_current_user_id)],
 ) -> OrderResponse:
-
     try:
         order = await reserve_seat(
             db, redis, user_id, req.flight_id, req.seat_code
@@ -76,7 +74,6 @@ async def reserve_flight_seat(
             status_code=409,
             detail="Seat is already reserved or unavailable.",
         )
-
 
     await schedule_order_timeout(
         redis,
@@ -94,7 +91,6 @@ async def pay_flight_order(
     db: Annotated[AsyncSession, Depends(get_db)],
     user_id: Annotated[uuid.UUID, Depends(get_current_user_id)],
 ) -> OrderResponse:
-
     try:
         order = await pay_order(db, order_id, user_id)
     except OrderNotFoundException as e:

@@ -32,9 +32,7 @@ LOGIN_EMAIL    = "test@example.com"
 LOGIN_PASSWORD = "password123"
 
 
-
 async def check_server(base_url: str = BASE_URL) -> bool:
-
     try:
         async with aiohttp.ClientSession() as s:
             async with s.get(f"{base_url}/health", timeout=aiohttp.ClientTimeout(total=3)) as r:
@@ -60,7 +58,6 @@ async def login(session: aiohttp.ClientSession, base_url: str = BASE_URL) -> str
 
 
 async def reset_seat_via_redis(flight_id: str, seat_code: str) -> None:
-
     try:
         import redis.asyncio as aioredis
         from database import settings
@@ -82,7 +79,6 @@ async def reserve(
     seat_code: str,
     base_url: str = BASE_URL,
 ) -> str:
-
     url = f"{base_url}/api/v1/orders/reserve"
     reserve_body = {"flight_id": flight_id, "seat_code": seat_code}
     try:
@@ -95,6 +91,9 @@ async def reserve(
             elif status == 409:
                 print(f"  [409] [{idx:02d}] conflict: {body.get('detail')}")
                 return "conflict"
+            elif status == 429:
+                print(f"  [429] [{idx:02d}] rate limited: {body.get('detail')}")
+                return "rate_limited"
             elif status == 404:
                 print(f"  [404] [{idx:02d}] not found: {body.get('detail')}")
                 return "error"
@@ -119,7 +118,6 @@ async def main(concurrency: int, seat_code: str, flight_id: str, reset: bool, ba
     print(f"  Reset Seat:  {'Yes' if reset else 'No'}")
     print("=" * 60)
 
-
     print("\n[1/4] Checking server availability ...")
     alive = await check_server(base_url)
     if not alive:
@@ -130,14 +128,12 @@ async def main(concurrency: int, seat_code: str, flight_id: str, reset: bool, ba
         sys.exit(1)
     print("  Server is online.\n")
 
-
     if reset:
         print("[2/4] Resetting seat in Redis ...")
         await reset_seat_via_redis(flight_id, seat_code)
         print()
     else:
         print("[2/4] Skipping seat reset (use --reset to enable).\n")
-
 
     print("[3/4] Logging in as test user ...")
     async with aiohttp.ClientSession() as login_session:
@@ -149,7 +145,6 @@ async def main(concurrency: int, seat_code: str, flight_id: str, reset: bool, ba
     headers = {"Authorization": f"Bearer {token}"}
     print("  Login OK. Token acquired.\n")
 
-
     print(f"[4/4] Firing {concurrency} concurrent reserve requests ...")
     print("-" * 60)
     connector = aiohttp.TCPConnector(limit=concurrency)
@@ -160,18 +155,20 @@ async def main(concurrency: int, seat_code: str, flight_id: str, reset: bool, ba
         ]
         results = await asyncio.gather(*tasks)
 
-
     counts = Counter(results)
     print()
     print("=" * 60)
-    print(f"  Success:   {counts['success']}")
-    print(f"  Conflict:  {counts['conflict']}")
-    print(f"  Error:     {counts['error']}")
-    print(f"  Exception: {counts['exception']}")
+    print(f"  Success:      {counts['success']}")
+    print(f"  Conflict:     {counts['conflict']}")
+    print(f"  Rate Limited: {counts['rate_limited']}")
+    print(f"  Error:        {counts['error']}")
+    print(f"  Exception:    {counts['exception']}")
     print("=" * 60)
 
-    if counts["success"] == 1:
+    if counts["success"] == 1 and counts["error"] == 0 and counts["exception"] == 0:
         print("  RESULT: PASS — exactly 1 reservation succeeded.")
+    elif counts["success"] == 1:
+        print("  RESULT: PASS — exactly 1 reservation succeeded (with errors/exceptions).")
     elif counts["success"] == 0:
         print("  RESULT: FAIL — no reservations succeeded. Check server logs.")
     else:

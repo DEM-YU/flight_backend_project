@@ -60,7 +60,6 @@ async def login(
     access_token = create_access_token(user.id)
     refresh_token = create_refresh_token(user.id)
 
-
     redis_key = f"refresh_token:{refresh_token}"
     ttl_seconds = settings.REFRESH_TOKEN_EXPIRE_DAYS * 24 * 3600
     await redis.setex(redis_key, ttl_seconds, str(user.id))
@@ -88,7 +87,6 @@ async def refresh(
     req: RefreshRequest,
     redis: Annotated[aioredis.Redis, Depends(get_redis)],
 ):
-
     try:
         claims = jwt.decode(
             req.refresh_token,

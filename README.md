@@ -48,7 +48,7 @@ sequenceDiagram
         
         alt PG Commit Success
             DB-->>API: Transaction Committed
-            Note over API: Register Async Background Timeout Task
+            API->>Redis: ZADD order:timeout:zset (Schedule 60s Expiration)
             API-->>Client: HTTP 201 Created (Order Response)
         else PG Commit Failure (Database down / exception)
             DB-->>API: DB Exception & Rollback
@@ -115,25 +115,25 @@ graph TD
 
 ---
 
-## 📂 Project Directory Structure
+## Project Structure
 
-Here is a curated directory layout explaining the core logic files:
-
-*   📂 **`flight_backend_project/`**
-    *   📄 [main.py](file:///Users/brooks/github/flight_backend_project/main.py): FastAPI application initialization, exception handlers, and lifespan handlers.
-    *   📄 [api.py](file:///Users/brooks/github/flight_backend_project/api.py): Flight search and seat reservation routes.
-    *   📄 [auth_api.py](file:///Users/brooks/github/flight_backend_project/auth_api.py): User registration, login, logout, and token refresh endpoints.
-    *   📄 [services.py](file:///Users/brooks/github/flight_backend_project/services.py): Central core service layer (Lua scripts execution, Cache-aside logic, compensating rollback, background timeout cancellation).
-    *   📄 [rate_limiter.py](file:///Users/brooks/github/flight_backend_project/rate_limiter.py): Distributed sliding-window rate limiting dependency via Redis ZSet.
-    *   📄 [models.py](file:///Users/brooks/github/flight_backend_project/models.py): SQLAlchemy models (users, flights, seats, orders) and Pydantic schemas.
-    *   📄 [auth.py](file:///Users/brooks/github/flight_backend_project/auth.py): Password hashing (bcrypt) and JWT encode/decode helper functions.
-    *   📄 [database.py](file:///Users/brooks/github/flight_backend_project/database.py): Asynchronous DB engines, session makers, Redis clients, and environment settings.
-    *   📄 [seed.py](file:///Users/brooks/github/flight_backend_project/seed.py): Mock database seeder initializing flights and seats for test purposes.
-    *   📄 [stress_test.py](file:///Users/brooks/github/flight_backend_project/stress_test.py): Concurrent request simulation verifying zero-overselling.
-    *   📂 **`tests/`**
-        *   📄 [test_auth.py](file:///Users/brooks/github/flight_backend_project/tests/test_auth.py): Integration tests validating user sign-up, dual-token generation, refresh, and logout.
-        *   📄 [test_services.py](file:///Users/brooks/github/flight_backend_project/tests/test_services.py): Unit tests for flight queries, Lua locking mechanism, and timeout cancellations.
-        *   📄 [test_rate_limiter.py](file:///Users/brooks/github/flight_backend_project/tests/test_rate_limiter.py): Unit and integration tests for sliding window rate limiting and RFC 6585 headers.
+```
+flight_backend_project/
+├── main.py          # FastAPI application, exception handlers, and lifespan
+├── api.py           # Flight search and seat reservation endpoints
+├── auth_api.py      # Registration, login, logout, and token refresh endpoints
+├── services.py      # Reservation logic, Redis Lua scripts, and timeout worker
+├── rate_limiter.py  # Sliding-window rate limiting dependency via Redis ZSet
+├── models.py        # SQLAlchemy models and Pydantic schemas
+├── auth.py          # Password hashing (bcrypt) and JWT utilities
+├── database.py      # Database engines, session makers, and settings
+├── seed.py          # Database seeder initializing flights and seats for testing
+├── stress_test.py   # Concurrency test script for overselling verification
+└── tests/
+    ├── test_auth.py         # Authentication and token lifecycle tests
+    ├── test_services.py     # Unit tests for reservation, locking, and timeout
+    └── test_rate_limiter.py # Unit and integration tests for rate limiting
+```
 
 ---
 
@@ -145,6 +145,7 @@ Here is a curated directory layout explaining the core logic files:
 | **POST** | `/api/v1/auth/login` | Authenticate and return Access + Refresh Token | None |
 | **POST** | `/api/v1/auth/logout` | Revoke user session and delete Refresh Token from Redis | **Refresh Token** |
 | **POST** | `/api/v1/auth/refresh` | Reissue Access Token using a valid Refresh Token | None |
+| **GET** | `/health` | Health check endpoint returning database and Redis connectivity | None |
 | **GET** | `/api/v1/flights` | Search flights (Cache-Aside, returns `X-Cache-Status` header) | None |
 | **POST** | `/api/v1/orders/reserve` | Reserve seat atomically (Returns order details, schedules timeout) | **JWT Access Token** |
 | **POST** | `/api/v1/orders/{order_id}/pay` | Confirm payment for order, update status to Confirmed, and mark seat occupied in DB | **JWT Access Token** |
@@ -189,25 +190,53 @@ pytest -v
 
 ---
 
-## 📈 Concurrency & Stress Testing (Benchmark)
+## Concurrency Testing
 
-To prove that the Lua engine guarantees **zero-overselling** under high concurrent pressure:
+A concurrency script verifies that concurrent requests for the same seat result in exactly one successful reservation:
 
-1. Running the custom stress test script:
-   ```bash
-   python stress_test.py
-   ```
-2. **What this script does:**
-   - Registers a test user and logs in to retrieve a JWT Access Token.
-   - Spawns **30 concurrent async workers** requesting the exact same seat code (`12A`) on flight `AA100` at the exact same millisecond.
-3. **Expected Terminal Output:**
-   ```text
-   Starting stress test...
-   [Worker 1] Status: 201 - Reservation Success (Order Created)
-   [Worker 2] Status: 409 - Seat is already reserved or unavailable.
-   [Worker 3] Status: 409 - Seat is already reserved or unavailable.
-   ...
-   [Worker 30] Status: 409 - Seat is already reserved or unavailable.
-   
-   Summary: 1 success, 29 failed (conflict). Overselling prevented successfully!
-   ```
+```bash
+python stress_test.py
+```
+
+**Test Flow:**
+1. Logs in with the test user (`test@example.com`) to retrieve a JWT Access Token.
+2. Fires **30 concurrent async requests** for the same seat (`1A`) on flight `00000000-0000-0000-0000-000000000001`.
+3. Verifies that exactly 1 request succeeds (HTTP 201), while the remaining requests receive conflict (HTTP 409) or rate limited (HTTP 429).
+
+**Sample Output:**
+```text
+============================================================
+  Flight Seat Reservation — Stress Test
+============================================================
+  Server:      http://127.0.0.1:8000
+  Flight ID:   00000000-0000-0000-0000-000000000001
+  Seat Code:   1A
+  Concurrency: 30
+  Reset Seat:  No
+============================================================
+
+[1/4] Checking server availability ...
+  Server is online.
+
+[2/4] Skipping seat reset (use --reset to enable).
+
+[3/4] Logging in as test user ...
+  Login OK. Token acquired.
+
+[4/4] Firing 30 concurrent reserve requests ...
+------------------------------------------------------------
+  [OK]  [01] reserved, order_id=...
+  [409] [02] conflict: Seat is already reserved or unavailable.
+  ...
+  [429] [11] rate limited: Too many requests. Please try again later.
+  ...
+============================================================
+  Success:      1
+  Conflict:     9
+  Rate Limited: 20
+  Error:        0
+  Exception:    0
+============================================================
+  RESULT: PASS — exactly 1 reservation succeeded.
+============================================================
+```

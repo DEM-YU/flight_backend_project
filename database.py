@@ -6,7 +6,6 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 
 class Settings(BaseSettings):
-
     POSTGRES_USER: str = "flight_user"
     POSTGRES_PASSWORD: str = "flight_pass"
     POSTGRES_SERVER: str = "localhost"
@@ -59,13 +58,11 @@ redis_pool = aioredis.ConnectionPool.from_url(
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
-
     async with AsyncSessionLocal() as session:
         yield session
 
 
 async def get_redis() -> AsyncGenerator[aioredis.Redis, None]:
-
     client = aioredis.Redis(connection_pool=redis_pool)
     try:
         yield client

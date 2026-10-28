@@ -11,14 +11,12 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
 class OrderStatus(StrEnum):
-
     PENDING = "Pending"
     CONFIRMED = "Confirmed"
     CANCELLED = "Cancelled"
 
 
 class SeatState(StrEnum):
-
     AVAILABLE = "0"
     LOCKED = "1"
 
@@ -28,7 +26,6 @@ class Base(DeclarativeBase):
 
 
 class User(Base):
-
     __tablename__ = "users"
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -43,7 +40,6 @@ class User(Base):
 
 
 class Flight(Base):
-
     __tablename__ = "flights"
     __table_args__ = (
         Index("ix_flight_departure_arrival", "departure", "arrival"),
@@ -59,7 +55,6 @@ class Flight(Base):
 
 
 class Seat(Base):
-
     __tablename__ = "seats"
     __table_args__ = (
         UniqueConstraint("flight_id", "seat_code", name="uq_seat_flight_seat_code"),
@@ -76,7 +71,6 @@ class Seat(Base):
     status: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
 class Order(Base):
-
     __tablename__ = "orders"
     __table_args__ = (
         Index("ix_order_status_created", "status", "created_at"),
@@ -104,7 +98,6 @@ class Order(Base):
 
 
 class FlightResponse(BaseModel):
-
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
@@ -115,13 +108,11 @@ class FlightResponse(BaseModel):
 
 
 class ReserveRequest(BaseModel):
-
     flight_id: uuid.UUID
     seat_code: str
 
 
 class OrderResponse(BaseModel):
-
     model_config = ConfigDict(from_attributes=True)
 
     id: uuid.UUID
