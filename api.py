@@ -10,8 +10,12 @@ from database import get_db, get_redis
 from models import FlightResponse, OrderResponse, ReserveRequest
 from auth import get_current_user_id
 from services import (
+    InvalidOrderStatusException,
+    OrderForbiddenException,
+    OrderNotFoundException,
     SeatNotFoundException,
     SeatUnavailableException,
+    pay_order,
     process_order_timeout,
     reserve_seat,
     search_flights,
@@ -70,5 +74,24 @@ async def reserve_flight_seat(
         str(payload.flight_id),
         payload.seat_code,
     )
+
+    return OrderResponse.model_validate(order)
+
+
+@router.post("/orders/{order_id}/pay", response_model=OrderResponse)
+async def pay_flight_order(
+    order_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user_id: Annotated[uuid.UUID, Depends(get_current_user_id)],
+) -> OrderResponse:
+    """Pay for a pending order, confirming the reservation and persisting seat status."""
+    try:
+        order = await pay_order(db, order_id, user_id)
+    except OrderNotFoundException as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except OrderForbiddenException as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except InvalidOrderStatusException as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     return OrderResponse.model_validate(order)

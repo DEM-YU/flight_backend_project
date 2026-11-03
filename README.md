@@ -140,6 +140,7 @@ Here is a curated directory layout explaining the core logic files:
 | **POST** | `/api/v1/auth/refresh` | Reissue Access Token using a valid Refresh Token | None |
 | **GET** | `/api/v1/flights` | Search flights (Utilizes Cache-Aside, return cache status header) | None |
 | **POST** | `/api/v1/orders/reserve` | Reserve seat atomically (Returns order details, schedules timeout) | **JWT Access Token** |
+| **POST** | `/api/v1/orders/{order_id}/pay` | Confirm payment for order, update status to Confirmed, and mark seat occupied in DB | **JWT Access Token** |
 
 ---
 

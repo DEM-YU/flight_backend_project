@@ -18,8 +18,12 @@ import pytest
 
 from models import FlightResponse, OrderStatus, SeatState
 from services import (
+    InvalidOrderStatusException,
+    OrderForbiddenException,
+    OrderNotFoundException,
     SeatNotFoundException,
     SeatUnavailableException,
+    pay_order,
     process_order_timeout,
     reserve_seat,
     search_flights,
@@ -264,3 +268,144 @@ class TestProcessOrderTimeout:
                 await process_order_timeout(redis, str(uuid.uuid4()), "f", "1A", delay=0)
 
         redis.hset.assert_not_called()
+
+
+# pay_order — order payment confirmation and seat status persistence
+
+class TestPayOrder:
+    """Tests for pay_order() confirming payment and updating seat status."""
+
+    async def test_pay_order_success(self):
+        """A pending order owned by user is confirmed and seat is marked occupied (1)."""
+        db = AsyncMock()
+        order_id = uuid.uuid4()
+        user_id = uuid.uuid4()
+        flight_id = uuid.uuid4()
+        seat_code = "12A"
+
+        mock_order = MagicMock()
+        mock_order.id = order_id
+        mock_order.user_id = user_id
+        mock_order.flight_id = flight_id
+        mock_order.seat_code = seat_code
+        mock_order.status = OrderStatus.PENDING
+
+        mock_seat = MagicMock()
+        mock_seat.status = 0
+
+        # db.execute calls: first for Order, second for Seat
+        order_exec_result = MagicMock()
+        order_exec_result.scalar_one_or_none.return_value = mock_order
+
+        seat_exec_result = MagicMock()
+        seat_exec_result.scalar_one_or_none.return_value = mock_seat
+
+        db.execute.side_effect = [order_exec_result, seat_exec_result]
+
+        paid_order = await pay_order(db, order_id, user_id)
+
+        assert paid_order.status == OrderStatus.CONFIRMED
+        assert mock_seat.status == 1
+        db.commit.assert_called_once()
+        db.refresh.assert_called_once_with(mock_order)
+
+    async def test_pay_order_not_found_raises(self):
+        """Paying a non-existent order raises OrderNotFoundException."""
+        db = AsyncMock()
+        order_exec_result = MagicMock()
+        order_exec_result.scalar_one_or_none.return_value = None
+        db.execute.return_value = order_exec_result
+
+        with pytest.raises(OrderNotFoundException):
+            await pay_order(db, uuid.uuid4(), uuid.uuid4())
+
+    async def test_pay_order_forbidden_for_other_user(self):
+        """A user cannot pay for someone else's order."""
+        db = AsyncMock()
+        owner_id = uuid.uuid4()
+        different_user_id = uuid.uuid4()
+
+        mock_order = MagicMock()
+        mock_order.user_id = owner_id
+        order_exec_result = MagicMock()
+        order_exec_result.scalar_one_or_none.return_value = mock_order
+        db.execute.return_value = order_exec_result
+
+        with pytest.raises(OrderForbiddenException):
+            await pay_order(db, uuid.uuid4(), different_user_id)
+
+    async def test_pay_order_already_cancelled_raises(self):
+        """Paying an already CANCELLED order raises InvalidOrderStatusException."""
+        db = AsyncMock()
+        user_id = uuid.uuid4()
+
+        mock_order = MagicMock()
+        mock_order.user_id = user_id
+        mock_order.status = OrderStatus.CANCELLED
+        order_exec_result = MagicMock()
+        order_exec_result.scalar_one_or_none.return_value = mock_order
+        db.execute.return_value = order_exec_result
+
+        with pytest.raises(InvalidOrderStatusException):
+            await pay_order(db, uuid.uuid4(), user_id)
+
+    async def test_pay_order_already_confirmed_raises(self):
+        """Paying an already CONFIRMED order raises InvalidOrderStatusException."""
+        db = AsyncMock()
+        user_id = uuid.uuid4()
+
+        mock_order = MagicMock()
+        mock_order.user_id = user_id
+        mock_order.status = OrderStatus.CONFIRMED
+        order_exec_result = MagicMock()
+        order_exec_result.scalar_one_or_none.return_value = mock_order
+        db.execute.return_value = order_exec_result
+
+        with pytest.raises(InvalidOrderStatusException):
+            await pay_order(db, uuid.uuid4(), user_id)
+
+
+class TestPayOrderAPI:
+    """API integration tests for POST /api/v1/orders/{order_id}/pay."""
+
+    async def test_pay_endpoint_success(self):
+        from httpx import AsyncClient, ASGITransport
+        from main import app
+        from database import get_db
+        from auth import get_current_user_id
+
+        user_id = uuid.uuid4()
+        order_id = uuid.uuid4()
+
+        mock_db = MagicMock()
+        mock_order = MagicMock()
+        mock_order.id = order_id
+        mock_order.user_id = user_id
+        mock_order.flight_id = uuid.uuid4()
+        mock_order.seat_code = "1A"
+        mock_order.status = OrderStatus.PENDING
+        mock_order.created_at = datetime.now(timezone.utc)
+
+        mock_seat = MagicMock()
+        mock_seat.status = 0
+
+        order_res = MagicMock()
+        order_res.scalar_one_or_none.return_value = mock_order
+        seat_res = MagicMock()
+        seat_res.scalar_one_or_none.return_value = mock_seat
+
+        mock_db.execute = AsyncMock(side_effect=[order_res, seat_res])
+        mock_db.commit = AsyncMock()
+        mock_db.refresh = AsyncMock()
+
+        app.dependency_overrides[get_db] = lambda: mock_db
+        app.dependency_overrides[get_current_user_id] = lambda: user_id
+        try:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+                resp = await client.post(f"/api/v1/orders/{order_id}/pay")
+                assert resp.status_code == 200
+                data = resp.json()
+                assert data["status"] == "Confirmed"
+                assert data["id"] == str(order_id)
+        finally:
+            app.dependency_overrides.clear()
