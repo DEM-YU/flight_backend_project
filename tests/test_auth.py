@@ -1,22 +1,18 @@
 import uuid
-import pytest
-from unittest.mock import AsyncMock, MagicMock
 import jwt
+import pytest
 from fastapi import HTTPException, status
-from fastapi.testclient import TestClient
+from sqlalchemy import select
 
-from main import app
-from database import get_db, get_redis, settings
-from models import User
 from auth import (
-    hash_password,
-    verify_password,
     create_access_token,
     create_refresh_token,
     get_current_user_id,
+    hash_password,
+    verify_password,
 )
-
-client = TestClient(app)
+from database import settings
+from models import User
 
 
 def test_password_hashing():
@@ -62,148 +58,145 @@ async def test_get_current_user_id_invalid():
     assert exc.value.status_code == status.HTTP_401_UNAUTHORIZED
 
 
+@pytest.mark.asyncio
 class TestAuthAPI:
-    def test_register_success(self):
-        db_mock = MagicMock()
-        db_mock.execute = AsyncMock()
-        db_mock.execute.return_value.scalar_one_or_none = MagicMock(return_value=None)
-        db_mock.commit = AsyncMock()
+    async def test_register_success(self, async_client, db_session):
+        email = f"new_{uuid.uuid4().hex[:6]}@example.com"
+        resp = await async_client.post(
+            "/api/v1/auth/register",
+            json={"email": email, "password": "password123"},
+        )
+        assert resp.status_code == 201
+        data = resp.json()
+        assert data["email"] == email
 
-        app.dependency_overrides[get_db] = lambda: db_mock
-        try:
-            resp = client.post(
-                "/api/v1/auth/register",
-                json={"email": "new@example.com", "password": "password123"}
-            )
-            assert resp.status_code == 201
-            assert resp.json()["email"] == "new@example.com"
-            db_mock.commit.assert_called_once()
-        finally:
-            app.dependency_overrides.clear()
+        # Verify user exists in PostgreSQL
+        stmt = select(User).where(User.email == email)
+        user = (await db_session.execute(stmt)).scalar_one_or_none()
+        assert user is not None
 
-    def test_register_duplicate(self):
-        db_mock = MagicMock()
-        db_mock.execute = AsyncMock()
-        db_mock.execute.return_value.scalar_one_or_none = MagicMock(
-            return_value=User(email="exists@example.com")
+    async def test_register_duplicate(self, async_client):
+        email = f"dup_{uuid.uuid4().hex[:6]}@example.com"
+        resp1 = await async_client.post(
+            "/api/v1/auth/register",
+            json={"email": email, "password": "password123"},
+        )
+        assert resp1.status_code == 201
+
+        resp2 = await async_client.post(
+            "/api/v1/auth/register",
+            json={"email": email, "password": "password123"},
+        )
+        assert resp2.status_code == 400
+        assert "Email already registered" in resp2.json()["detail"]
+
+    async def test_login_success(self, async_client, redis_client):
+        email = f"login_{uuid.uuid4().hex[:6]}@example.com"
+        await async_client.post(
+            "/api/v1/auth/register",
+            json={"email": email, "password": "password123"},
         )
 
-        app.dependency_overrides[get_db] = lambda: db_mock
-        try:
-            resp = client.post(
-                "/api/v1/auth/register",
-                json={"email": "exists@example.com", "password": "password123"}
-            )
-            assert resp.status_code == 400
-            assert "Email already registered" in resp.json()["detail"]
-        finally:
-            app.dependency_overrides.clear()
+        resp = await async_client.post(
+            "/api/v1/auth/login",
+            json={"email": email, "password": "password123"},
+        )
+        assert resp.status_code == 200
+        tokens = resp.json()
+        assert "access_token" in tokens
+        assert "refresh_token" in tokens
 
-    def test_login_success(self):
-        db_mock = MagicMock()
-        redis_mock = AsyncMock()
+        # Verify Refresh Token is physically stored in Redis
+        exists = await redis_client.exists(f"refresh_token:{tokens['refresh_token']}")
+        assert exists == 1
 
-        hashed = hash_password("mypassword")
-        user = User(id=uuid.uuid4(), email="user@example.com", hashed_password=hashed)
+    async def test_login_failure(self, async_client):
+        email = f"fail_{uuid.uuid4().hex[:6]}@example.com"
+        await async_client.post(
+            "/api/v1/auth/register",
+            json={"email": email, "password": "password123"},
+        )
 
-        db_mock.execute = AsyncMock()
-        db_mock.execute.return_value.scalar_one_or_none = MagicMock(return_value=user)
+        resp = await async_client.post(
+            "/api/v1/auth/login",
+            json={"email": email, "password": "wrong_password"},
+        )
+        assert resp.status_code == 401
+        assert "Invalid email or password" in resp.json()["detail"]
 
-        app.dependency_overrides[get_db] = lambda: db_mock
-        app.dependency_overrides[get_redis] = lambda: redis_mock
-        try:
-            resp = client.post(
-                "/api/v1/auth/login",
-                json={"email": "user@example.com", "password": "mypassword"}
-            )
-            assert resp.status_code == 200
-            data = resp.json()
-            assert "access_token" in data
-            assert "refresh_token" in data
-            redis_mock.setex.assert_called_once()
-        finally:
-            app.dependency_overrides.clear()
+    async def test_logout_success(self, async_client, redis_client):
+        email = f"logout_{uuid.uuid4().hex[:6]}@example.com"
+        await async_client.post(
+            "/api/v1/auth/register",
+            json={"email": email, "password": "password123"},
+        )
+        login_resp = await async_client.post(
+            "/api/v1/auth/login",
+            json={"email": email, "password": "password123"},
+        )
+        refresh_token = login_resp.json()["refresh_token"]
 
-    def test_login_failure(self):
-        db_mock = MagicMock()
-        db_mock.execute = AsyncMock()
-        db_mock.execute.return_value.scalar_one_or_none = MagicMock(return_value=None)
+        # Call logout
+        resp = await async_client.post(
+            "/api/v1/auth/logout",
+            json={"refresh_token": refresh_token},
+        )
+        assert resp.status_code == 200
+        assert "Logged out successfully" in resp.json()["message"]
 
-        app.dependency_overrides[get_db] = lambda: db_mock
-        try:
-            resp = client.post(
-                "/api/v1/auth/login",
-                json={"email": "user@example.com", "password": "wrong_password"}
-            )
-            assert resp.status_code == 401
-            assert "Invalid email or password" in resp.json()["detail"]
-        finally:
-            app.dependency_overrides.clear()
+        # Verify token is deleted from Redis
+        exists = await redis_client.exists(f"refresh_token:{refresh_token}")
+        assert exists == 0
 
-    def test_logout_success(self):
-        redis_mock = AsyncMock()
-        redis_mock.delete.return_value = 1
+    async def test_logout_invalid_token(self, async_client):
+        resp = await async_client.post(
+            "/api/v1/auth/logout",
+            json={"refresh_token": "nonexistent_token"},
+        )
+        assert resp.status_code == 400
+        assert "Token is already invalid" in resp.json()["detail"]
 
-        app.dependency_overrides[get_redis] = lambda: redis_mock
-        try:
-            resp = client.post(
-                "/api/v1/auth/logout",
-                json={"refresh_token": "some_refresh_token"}
-            )
-            assert resp.status_code == 200
-            assert "Logged out successfully" in resp.json()["message"]
-            redis_mock.delete.assert_called_once_with("refresh_token:some_refresh_token")
-        finally:
-            app.dependency_overrides.clear()
+    async def test_refresh_success(self, async_client):
+        email = f"refresh_{uuid.uuid4().hex[:6]}@example.com"
+        await async_client.post(
+            "/api/v1/auth/register",
+            json={"email": email, "password": "password123"},
+        )
+        login_resp = await async_client.post(
+            "/api/v1/auth/login",
+            json={"email": email, "password": "password123"},
+        )
+        refresh_token = login_resp.json()["refresh_token"]
 
-    def test_logout_invalid_token(self):
-        redis_mock = AsyncMock()
-        redis_mock.delete.return_value = 0
+        resp = await async_client.post(
+            "/api/v1/auth/refresh",
+            json={"refresh_token": refresh_token},
+        )
+        assert resp.status_code == 200
+        assert "access_token" in resp.json()
 
-        app.dependency_overrides[get_redis] = lambda: redis_mock
-        try:
-            resp = client.post(
-                "/api/v1/auth/logout",
-                json={"refresh_token": "nonexistent_token"}
-            )
-            assert resp.status_code == 400
-            assert "Token is already invalid" in resp.json()["detail"]
-        finally:
-            app.dependency_overrides.clear()
+    async def test_refresh_invalidated_by_logout(self, async_client):
+        email = f"inv_{uuid.uuid4().hex[:6]}@example.com"
+        await async_client.post(
+            "/api/v1/auth/register",
+            json={"email": email, "password": "password123"},
+        )
+        login_resp = await async_client.post(
+            "/api/v1/auth/login",
+            json={"email": email, "password": "password123"},
+        )
+        refresh_token = login_resp.json()["refresh_token"]
 
-    def test_refresh_success(self):
-        redis_mock = AsyncMock()
-        redis_mock.exists.return_value = True
+        # Logout first
+        await async_client.post(
+            "/api/v1/auth/logout",
+            json={"refresh_token": refresh_token},
+        )
 
-        user_id = uuid.uuid4()
-        refresh_token = create_refresh_token(user_id)
-
-        app.dependency_overrides[get_redis] = lambda: redis_mock
-        try:
-            resp = client.post(
-                "/api/v1/auth/refresh",
-                json={"refresh_token": refresh_token}
-            )
-            assert resp.status_code == 200
-            assert "access_token" in resp.json()
-            redis_mock.exists.assert_called_once_with(f"refresh_token:{refresh_token}")
-        finally:
-            app.dependency_overrides.clear()
-
-    def test_refresh_invalidated_by_logout(self):
-        redis_mock = AsyncMock()
-        redis_mock.exists.return_value = False
-
-        user_id = uuid.uuid4()
-        refresh_token = create_refresh_token(user_id)
-
-        app.dependency_overrides[get_redis] = lambda: redis_mock
-        try:
-            resp = client.post(
-                "/api/v1/auth/refresh",
-                json={"refresh_token": refresh_token}
-            )
-            assert resp.status_code == 401
-            assert "Refresh token has been invalidated or expired" in resp.json()["detail"]
-        finally:
-            app.dependency_overrides.clear()
+        # Refresh attempt must fail with 401
+        resp = await async_client.post(
+            "/api/v1/auth/refresh",
+            json={"refresh_token": refresh_token},
+        )
+        assert resp.status_code == 401
+        assert "Refresh token has been invalidated or expired" in resp.json()["detail"]
