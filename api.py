@@ -3,7 +3,7 @@ from datetime import date
 from typing import Annotated
 
 import redis.asyncio as aioredis
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db, get_redis
@@ -16,8 +16,8 @@ from services import (
     SeatNotFoundException,
     SeatUnavailableException,
     pay_order,
-    process_order_timeout,
     reserve_seat,
+    schedule_order_timeout,
     search_flights,
 )
 
@@ -46,12 +46,11 @@ async def list_flights(
 @router.post("/orders/reserve", response_model=OrderResponse, status_code=201)
 async def reserve_flight_seat(
     payload: ReserveRequest,
-    background_tasks: BackgroundTasks,
     db: Annotated[AsyncSession, Depends(get_db)],
     redis: Annotated[aioredis.Redis, Depends(get_redis)],
     user_id: Annotated[uuid.UUID, Depends(get_current_user_id)],
 ) -> OrderResponse:
-    """Reserve a seat atomically and schedule a background payment timeout."""
+    """Reserve a seat atomically and register a timeout in Redis ZSet delay queue."""
     try:
         order = await reserve_seat(
             db, redis, user_id, payload.flight_id, payload.seat_code
@@ -67,8 +66,8 @@ async def reserve_flight_seat(
             detail="Seat is already reserved or unavailable.",
         )
 
-    background_tasks.add_task(
-        process_order_timeout,
+    # Register crash-resilient timeout in Redis ZSet delay queue
+    await schedule_order_timeout(
         redis,
         str(order.id),
         str(payload.flight_id),

@@ -59,21 +59,22 @@ sequenceDiagram
     end
 ```
 
-### 2. Async Payment Timeout & Linear-Backoff Lock Release
+### 2. Crash-Resilient Redis ZSet Timeout Delay Queue
 
-Unpaid orders expire after **60 seconds**. A non-blocking asynchronous task monitors the order state. If it remains unpaid, it is cancelled in the database, and the seat is released in Redis using a retry mechanism with **linear backoff** to survive transient Redis disconnections.
+Unpaid orders expire after **60 seconds**. Rather than relying on fragile in-process sleep tasks that are lost upon server crashes or restarts, expiration is registered in a **Redis Sorted Set (ZSet)** delay queue (`score = unix_timestamp + 60s`). A background worker continuously polls and atomically pops due orders using a custom Lua script (`ZRANGEBYSCORE + ZREM`), cancels unpaid orders in PostgreSQL, and releases the Redis seat lock with **linear backoff retries**.
 
 ```mermaid
 graph TD
-    A[Order Created: Status = Pending] --> B[FastAPI Background Task triggers sleep 60s]
-    B --> C[Fetch Order Status via isolated DB Session]
-    C -->|Status is CONFIRMED/CANCELLED| D[No Action Needed - Exit]
-    C -->|Status is still PENDING| E[Update Order Status to CANCELLED in DB]
-    E --> F[Release Redis Lock: set seat to '0']
-    F -->|Success| G[Lock Released Successfully]
-    F -->|Failure due to network/Redis blip| H[Linear Backoff Retry]
-    H -->|Attempt 1-3 Success| G
-    H -->|All Retries Exhausted| I[CRITICAL Alarm: Log Ghost Lock for Manual Audit]
+    A[Order Created: Status = Pending] --> B["Register in Redis ZSet delay queue (score = now + 60s)"]
+    B --> C["Background Worker polls ZSet atomically via Lua script"]
+    C -->|Order Due & Popped| D[Fetch Order Status via isolated DB Session]
+    D -->|Status is CONFIRMED/CANCELLED| E[No Action Needed - Discard]
+    D -->|Status is still PENDING| F[Update Order Status to CANCELLED in DB]
+    F --> G["Release Redis Lock: set seat to '0'"]
+    G -->|Success| H[Lock Released Successfully]
+    G -->|Failure due to network/Redis blip| I[Linear Backoff Retry]
+    I -->|Attempt 1-3 Success| H
+    I -->|All Retries Exhausted| J[CRITICAL Alarm: Log Ghost Lock for Manual Audit]
 ```
 
 ---

@@ -23,6 +23,17 @@ _CACHE_EMPTY_TTL = 60
 _ORDER_TIMEOUT_SECONDS = 60
 _SEAT_RELEASE_MAX_RETRIES = 3
 
+ORDER_TIMEOUT_QUEUE_KEY = "order:timeout:zset"
+
+# Atomic pop script for Redis ZSet: fetches expired items and removes them in one step
+ZPOPMIN_BY_SCORE_SCRIPT = """
+local items = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, ARGV[2])
+if #items > 0 then
+    redis.call('ZREM', KEYS[1], unpack(items))
+end
+return items
+"""
+
 
 
 
@@ -166,22 +177,38 @@ async def reserve_seat(
         raise
 
 
-async def process_order_timeout(
+async def schedule_order_timeout(
     redis: aioredis.Redis,
     order_id: str,
     flight_id: str,
     seat_code: str,
     delay: int = _ORDER_TIMEOUT_SECONDS,
 ) -> None:
-    """Background task: auto-cancel unpaid orders after the payment window expires."""
-    # TODO: replace with a durable job queue (Celery / pg-based outbox) so
-    # timeouts survive process restarts. In-process sleep is a pragmatic
-    # starting point but loses tasks on crash.
+    """Register an order in the Redis Sorted Set (ZSet) delay queue.
+    
+    The score is the UNIX timestamp when the payment window expires.
+    Because tasks are persisted in Redis, they survive server crashes and restarts.
+    """
+    expire_at = datetime.now(timezone.utc).timestamp() + delay
+    payload = json.dumps({
+        "order_id": order_id,
+        "flight_id": flight_id,
+        "seat_code": seat_code,
+    })
+    await redis.zadd(ORDER_TIMEOUT_QUEUE_KEY, {payload: expire_at})
+    logger.info("Order %s scheduled for timeout in %ds via Redis ZSet", order_id, delay)
 
-    # 1. Wait for payment window
-    await asyncio.sleep(delay)
 
-    # 2. Check order status in an isolated session
+async def cancel_expired_order(
+    redis: aioredis.Redis,
+    order_id: str,
+    flight_id: str,
+    seat_code: str,
+) -> bool:
+    """Check order status in DB; if still PENDING, cancel it and release the Redis seat lock.
+    
+    Returns True if an order was cancelled or already confirmed, False on DB miss.
+    """
     async with AsyncSessionLocal() as db:
         result = await db.execute(
             select(Order).where(Order.id == UUID(order_id))
@@ -193,15 +220,14 @@ async def process_order_timeout(
                 "Order %s timeout check: status=%s, no action needed",
                 order_id, order.status if order else "NOT_FOUND",
             )
-            return
+            return False
 
-        # 3. Cancel the order
+        # Cancel the pending order
         order.status = OrderStatus.CANCELLED
         await db.commit()
-        logger.info("Order %s auto-cancelled after %ds timeout", order_id, delay)
+        logger.info("Order %s auto-cancelled by timeout worker", order_id)
 
-    # 4. Release seat lock with retries
-    # Retry with linear backoff; Redis blip shouldn't leave a ghost lock.
+    # Release seat lock with linear backoff retries to survive network hiccups
     seat_key = f"flight:{flight_id}:seats"
     for attempt in range(_SEAT_RELEASE_MAX_RETRIES):
         try:
@@ -210,7 +236,7 @@ async def process_order_timeout(
                 "Seat %s released on flight %s after order %s cancellation",
                 seat_code, flight_id, order_id,
             )
-            return
+            return True
         except Exception:
             logger.error(
                 "Failed to release seat %s on flight %s (attempt %d/%d)",
@@ -226,6 +252,68 @@ async def process_order_timeout(
         "is cancelled in DB. Manual intervention required.",
         seat_code, flight_id, order_id,
     )
+    return True
+
+
+async def process_expired_orders(
+    redis: aioredis.Redis,
+    batch_size: int = 50,
+) -> int:
+    """Fetch and cancel expired orders from the Redis ZSet.
+    
+    Uses an atomic Lua script (ZRANGEBYSCORE + ZREM) to prevent race conditions
+    when multiple worker instances or app replicas poll concurrently.
+    """
+    now_ts = datetime.now(timezone.utc).timestamp()
+    raw_items = await redis.eval(
+        ZPOPMIN_BY_SCORE_SCRIPT, 1, ORDER_TIMEOUT_QUEUE_KEY, now_ts, batch_size
+    )
+    if not raw_items:
+        return 0
+
+    processed = 0
+    for item_str in raw_items:
+        try:
+            data = json.loads(item_str)
+            await cancel_expired_order(
+                redis, data["order_id"], data["flight_id"], data["seat_code"]
+            )
+            processed += 1
+        except Exception:
+            logger.error("Error processing expired order payload %s", item_str, exc_info=True)
+
+    return processed
+
+
+async def run_timeout_worker(
+    redis: aioredis.Redis,
+    poll_interval: float = 1.0,
+) -> None:
+    """Continuously poll the Redis ZSet for expired orders until cancelled."""
+    logger.info("Started Redis ZSet timeout cancellation worker.")
+    try:
+        while True:
+            try:
+                await process_expired_orders(redis)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.error("Error in timeout worker poll cycle", exc_info=True)
+            await asyncio.sleep(poll_interval)
+    finally:
+        logger.info("Stopped Redis ZSet timeout cancellation worker.")
+
+
+async def process_order_timeout(
+    redis: aioredis.Redis,
+    order_id: str,
+    flight_id: str,
+    seat_code: str,
+    delay: int = _ORDER_TIMEOUT_SECONDS,
+) -> None:
+    """Legacy timeout handler kept for backwards compatibility with tests."""
+    await asyncio.sleep(delay)
+    await cancel_expired_order(redis, order_id, flight_id, seat_code)
 
 
 async def pay_order(

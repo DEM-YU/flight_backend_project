@@ -18,14 +18,18 @@ import pytest
 
 from models import FlightResponse, OrderStatus, SeatState
 from services import (
+    ORDER_TIMEOUT_QUEUE_KEY,
     InvalidOrderStatusException,
     OrderForbiddenException,
     OrderNotFoundException,
     SeatNotFoundException,
     SeatUnavailableException,
+    cancel_expired_order,
     pay_order,
+    process_expired_orders,
     process_order_timeout,
     reserve_seat,
+    schedule_order_timeout,
     search_flights,
 )
 
@@ -268,6 +272,52 @@ class TestProcessOrderTimeout:
                 await process_order_timeout(redis, str(uuid.uuid4()), "f", "1A", delay=0)
 
         redis.hset.assert_not_called()
+
+
+class TestRedisZSetTimeoutQueue:
+    """Tests for crash-resilient Redis ZSet timeout queue."""
+
+    async def test_schedule_order_timeout(self):
+        """schedule_order_timeout adds order payload to Redis ZSet with score."""
+        redis = AsyncMock()
+        order_id = str(uuid.uuid4())
+        flight_id = str(uuid.uuid4())
+        seat_code = "7D"
+
+        await schedule_order_timeout(redis, order_id, flight_id, seat_code, delay=60)
+
+        redis.zadd.assert_called_once()
+        key, mapping = redis.zadd.call_args.args
+        assert key == ORDER_TIMEOUT_QUEUE_KEY
+        payload_str = list(mapping.keys())[0]
+        payload = json.loads(payload_str)
+        assert payload["order_id"] == order_id
+        assert payload["flight_id"] == flight_id
+        assert payload["seat_code"] == seat_code
+
+    async def test_process_expired_orders(self):
+        """process_expired_orders pops due orders from ZSet and triggers cancellation."""
+        redis = AsyncMock()
+        order_id = str(uuid.uuid4())
+        flight_id = str(uuid.uuid4())
+        seat_code = "8E"
+        raw_payload = json.dumps({"order_id": order_id, "flight_id": flight_id, "seat_code": seat_code})
+
+        # Lua atomic pop returns 1 expired item
+        redis.eval.return_value = [raw_payload]
+
+        with patch("services.cancel_expired_order", new_callable=AsyncMock) as mock_cancel:
+            count = await process_expired_orders(redis)
+            assert count == 1
+            mock_cancel.assert_called_once_with(redis, order_id, flight_id, seat_code)
+
+    async def test_process_expired_orders_empty(self):
+        """When no orders are expired, process_expired_orders returns 0."""
+        redis = AsyncMock()
+        redis.eval.return_value = []
+
+        count = await process_expired_orders(redis)
+        assert count == 0
 
 
 # pay_order — order payment confirmation and seat status persistence

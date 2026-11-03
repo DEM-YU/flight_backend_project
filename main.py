@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from typing import Annotated
@@ -14,16 +15,31 @@ from api import router
 from auth_api import router as auth_router
 from database import engine, get_db, get_redis, redis_pool
 from models import Base
+from services import run_timeout_worker
 
 logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Create tables on startup, dispose engine and Redis pool on shutdown."""
+    """Create tables on startup, launch Redis ZSet timeout worker, dispose on shutdown."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+    # Launch Redis ZSet delay queue worker task
+    worker_redis = aioredis.Redis(connection_pool=redis_pool)
+    worker_task = asyncio.create_task(run_timeout_worker(worker_redis))
+
     yield
+
+    # Gracefully terminate background worker
+    worker_task.cancel()
+    try:
+        await worker_task
+    except asyncio.CancelledError:
+        pass
+    await worker_redis.aclose()
+
     await engine.dispose()
     await redis_pool.aclose()
 
