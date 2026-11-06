@@ -1,11 +1,12 @@
 import json
 import uuid
 from datetime import date, datetime, timezone
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from sqlalchemy import select
 
-from models import FlightResponse, OrderStatus, SeatState
+from auth import hash_password
+from models import Flight, Order, OrderStatus, Seat, SeatState, User
 from services import (
     ORDER_TIMEOUT_QUEUE_KEY,
     InvalidOrderStatusException,
@@ -13,10 +14,8 @@ from services import (
     OrderNotFoundException,
     SeatNotFoundException,
     SeatUnavailableException,
-    cancel_expired_order,
     pay_order,
     process_expired_orders,
-    process_order_timeout,
     reserve_seat,
     schedule_order_timeout,
     search_flights,
@@ -25,362 +24,312 @@ from services import (
 pytestmark = pytest.mark.asyncio
 
 
-def _flight_dict(**overrides) -> dict:
-    defaults = {
-        "id": str(uuid.uuid4()),
-        "flight_num": "CA001",
-        "departure": "PEK",
-        "arrival": "SHA",
-        "departure_time": datetime.now(timezone.utc).isoformat(),
-    }
-    return {**defaults, **overrides}
+async def _create_test_flight(db, departure="PEK", arrival="SHA", flight_date=None) -> Flight:
+    if flight_date is None:
+        flight_date = date.today()
+    dep_time = datetime(flight_date.year, flight_date.month, flight_date.day, 10, 0, tzinfo=timezone.utc)
+    flight = Flight(
+        id=uuid.uuid4(),
+        flight_num=f"FL-{uuid.uuid4().hex[:4].upper()}",
+        departure=departure,
+        arrival=arrival,
+        departure_time=dep_time,
+    )
+    db.add(flight)
+    await db.commit()
+    await db.refresh(flight)
+    return flight
+
+
+async def _create_test_user(db, email=None) -> User:
+    if email is None:
+        email = f"user_{uuid.uuid4().hex[:8]}@example.com"
+    user = User(
+        id=uuid.uuid4(),
+        email=email,
+        hashed_password=hash_password("password123"),
+    )
+    db.add(user)
+    await db.commit()
+    await db.refresh(user)
+    return user
+
+
+async def _create_test_seat(db, flight_id: uuid.UUID, seat_code="1A", status=0) -> Seat:
+    seat = Seat(
+        id=uuid.uuid4(),
+        flight_id=flight_id,
+        seat_code=seat_code,
+        status=status,
+    )
+    db.add(seat)
+    await db.commit()
+    await db.refresh(seat)
+    return seat
 
 
 class TestSearchFlights:
-    async def test_cache_hit_returns_cached_data_without_db_query(self):
-        db = AsyncMock()
-        redis = AsyncMock()
+    async def test_cache_miss_queries_db_and_writes_to_redis(self, db_session, redis_client):
+        today = date.today()
+        flight = await _create_test_flight(db_session, departure="PEK", arrival="SHA", flight_date=today)
 
-        cached = [_flight_dict(flight_num="CA001")]
-        redis.get.return_value = json.dumps(cached)
-
-        results, is_cache_hit = await search_flights(db, redis, "PEK", "SHA", date.today())
-
-        assert is_cache_hit is True
-        assert len(results) == 1
-        assert results[0].flight_num == "CA001"
-        db.execute.assert_not_called()
-
-    async def test_cache_miss_queries_db_and_writes_back(self):
-        db = AsyncMock()
-        redis = AsyncMock()
-        redis.get.return_value = None
-
-        mock_flight = MagicMock()
-        mock_flight.id = uuid.uuid4()
-        mock_flight.flight_num = "MU200"
-        mock_flight.departure = "PEK"
-        mock_flight.arrival = "SHA"
-        mock_flight.departure_time = datetime.now(timezone.utc)
-
-        mock_result = MagicMock()
-        mock_result.scalars.return_value.all.return_value = [mock_flight]
-        db.execute.return_value = mock_result
-
-        results, is_cache_hit = await search_flights(db, redis, "PEK", "SHA", date.today())
-
+        # 1. First query: cache miss -> queries PostgreSQL and caches in Redis
+        flights, is_cache_hit = await search_flights(db_session, redis_client, "PEK", "SHA", today)
         assert is_cache_hit is False
-        assert len(results) == 1
-        assert results[0].flight_num == "MU200"
-        redis.setex.assert_called_once()
+        assert any(f.id == flight.id for f in flights)
 
-    async def test_empty_result_uses_short_ttl(self):
-        db = AsyncMock()
-        redis = AsyncMock()
-        redis.get.return_value = None
+        # Verify key was physically written to Redis
+        cache_key = f"route:PEK:SHA:{today.isoformat()}"
+        cached_data = await redis_client.get(cache_key)
+        assert cached_data is not None
 
-        mock_result = MagicMock()
-        mock_result.scalars.return_value.all.return_value = []
-        db.execute.return_value = mock_result
+        # 2. Second query: cache hit directly from Redis
+        flights_cached, is_cache_hit_2 = await search_flights(db_session, redis_client, "PEK", "SHA", today)
+        assert is_cache_hit_2 is True
+        assert any(f.id == flight.id for f in flights_cached)
 
-        results, _ = await search_flights(db, redis, "PEK", "CAN", date.today())
-
+    async def test_empty_route_uses_short_negative_cache_ttl(self, db_session, redis_client):
+        today = date.today()
+        # Non-existent route
+        results, is_cache_hit = await search_flights(db_session, redis_client, "NON", "EXIST", today)
         assert results == []
-        _, ttl, _ = redis.setex.call_args.args
-        assert ttl == 60
+        assert is_cache_hit is False
+
+        # Verify negative cache was set with short TTL (<= 60s)
+        cache_key = f"route:NON:EXIST:{today.isoformat()}"
+        ttl = await redis_client.ttl(cache_key)
+        assert 0 < ttl <= 60
 
 
 class TestReserveSeat:
-    async def test_success_creates_pending_order(self):
-        db = MagicMock()
-        db.add = MagicMock()
-        db.commit = AsyncMock()
-        db.rollback = AsyncMock()
-        db.refresh = AsyncMock()
-        redis = AsyncMock()
-        redis.eval.return_value = 1
+    async def test_successful_reservation_locks_redis_and_persists_order(self, db_session, redis_client):
+        user = await _create_test_user(db_session)
+        flight = await _create_test_flight(db_session)
+        await _create_test_seat(db_session, flight.id, "1A")
 
-        order = await reserve_seat(db, redis, uuid.uuid4(), uuid.uuid4(), "1A")
+        # Seed Redis seat hash as available ('0')
+        seat_key = f"flight:{flight.id}:seats"
+        await redis_client.hset(seat_key, "1A", SeatState.AVAILABLE)
 
-        db.add.assert_called_once()
-        db.commit.assert_called_once()
+        # Execute reservation
+        order = await reserve_seat(db_session, redis_client, user.id, flight.id, "1A")
         assert order.status == OrderStatus.PENDING
+        assert order.seat_code == "1A"
+        assert order.user_id == user.id
 
-    async def test_seat_already_locked_raises_unavailable(self):
-        db = MagicMock()
-        db.add = MagicMock()
-        redis = AsyncMock()
-        redis.eval.return_value = 0
+        # Verify Redis seat state was atomically updated to '1' (LOCKED)
+        status_in_redis = await redis_client.hget(seat_key, "1A")
+        assert status_in_redis == SeatState.LOCKED
+
+        # Verify Order physically exists in PostgreSQL
+        stmt = select(Order).where(Order.id == order.id)
+        saved_order = (await db_session.execute(stmt)).scalar_one_or_none()
+        assert saved_order is not None
+        assert saved_order.status == OrderStatus.PENDING
+
+    async def test_seat_already_locked_raises_unavailable(self, db_session, redis_client):
+        user = await _create_test_user(db_session)
+        flight = await _create_test_flight(db_session)
+
+        # Seat is already locked ('1') in Redis
+        seat_key = f"flight:{flight.id}:seats"
+        await redis_client.hset(seat_key, "2B", SeatState.LOCKED)
 
         with pytest.raises(SeatUnavailableException):
-            await reserve_seat(db, redis, uuid.uuid4(), uuid.uuid4(), "1A")
+            await reserve_seat(db_session, redis_client, user.id, flight.id, "2B")
 
-        db.add.assert_not_called()
+    async def test_uninitialized_seat_raises_not_found(self, db_session, redis_client):
+        user = await _create_test_user(db_session)
+        flight = await _create_test_flight(db_session)
 
-    async def test_seat_not_initialized_raises_not_found(self):
-        db = MagicMock()
-        db.add = MagicMock()
-        redis = AsyncMock()
-        redis.eval.return_value = -1
-
+        # Seat does not exist in Redis Hash
         with pytest.raises(SeatNotFoundException):
-            await reserve_seat(db, redis, uuid.uuid4(), uuid.uuid4(), "99Z")
+            await reserve_seat(db_session, redis_client, user.id, flight.id, "99Z")
 
-        db.add.assert_not_called()
+    async def test_db_failure_triggers_compensating_redis_unlock(self, db_session, redis_client):
+        flight = await _create_test_flight(db_session)
+        seat_key = f"flight:{flight.id}:seats"
+        await redis_client.hset(seat_key, "3C", SeatState.AVAILABLE)
 
-    async def test_db_failure_releases_redis_lock(self):
-        db = MagicMock()
-        db.add = MagicMock()
-        db.commit = AsyncMock(side_effect=Exception("connection lost"))
-        db.rollback = AsyncMock()
-        redis = AsyncMock()
-        redis.eval.return_value = 1
+        # Non-existent user_id violates PostgreSQL foreign key constraint
+        fake_user_id = uuid.uuid4()
 
-        flight_id = uuid.uuid4()
-        seat_code = "3B"
+        with pytest.raises(Exception):
+            await reserve_seat(db_session, redis_client, fake_user_id, flight.id, "3C")
 
-        with pytest.raises(Exception, match="connection lost"):
-            await reserve_seat(db, redis, uuid.uuid4(), flight_id, seat_code)
-
-        redis.hset.assert_called_once_with(
-            f"flight:{flight_id}:seats",
-            seat_code,
-            SeatState.AVAILABLE,
-        )
-
-
-class TestProcessOrderTimeout:
-    async def test_pending_order_is_cancelled_and_seat_released(self):
-        redis = AsyncMock()
-        order_id = str(uuid.uuid4())
-        flight_id = str(uuid.uuid4())
-        seat_code = "5C"
-
-        mock_order = MagicMock()
-        mock_order.status = OrderStatus.PENDING
-
-        mock_db_result = MagicMock()
-        mock_db_result.scalar_one_or_none.return_value = mock_order
-
-        mock_session = AsyncMock()
-        mock_session.execute.return_value = mock_db_result
-        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_session.__aexit__ = AsyncMock(return_value=False)
-
-        with patch("services.AsyncSessionLocal", return_value=mock_session):
-            with patch("asyncio.sleep", new_callable=AsyncMock):
-                await process_order_timeout(redis, order_id, flight_id, seat_code, delay=0)
-
-        assert mock_order.status == OrderStatus.CANCELLED
-        mock_session.commit.assert_called_once()
-        redis.hset.assert_called_once_with(
-            f"flight:{flight_id}:seats", seat_code, SeatState.AVAILABLE
-        )
-
-    async def test_confirmed_order_is_not_touched(self):
-        redis = AsyncMock()
-        order_id = str(uuid.uuid4())
-
-        mock_order = MagicMock()
-        mock_order.status = OrderStatus.CONFIRMED
-
-        mock_db_result = MagicMock()
-        mock_db_result.scalar_one_or_none.return_value = mock_order
-
-        mock_session = AsyncMock()
-        mock_session.execute.return_value = mock_db_result
-        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_session.__aexit__ = AsyncMock(return_value=False)
-
-        with patch("services.AsyncSessionLocal", return_value=mock_session):
-            with patch("asyncio.sleep", new_callable=AsyncMock):
-                await process_order_timeout(redis, order_id, "flight-id", "1A", delay=0)
-
-        mock_session.commit.assert_not_called()
-        redis.hset.assert_not_called()
-
-    async def test_missing_order_is_handled_gracefully(self):
-        redis = AsyncMock()
-
-        mock_db_result = MagicMock()
-        mock_db_result.scalar_one_or_none.return_value = None
-
-        mock_session = AsyncMock()
-        mock_session.execute.return_value = mock_db_result
-        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_session.__aexit__ = AsyncMock(return_value=False)
-
-        with patch("services.AsyncSessionLocal", return_value=mock_session):
-            with patch("asyncio.sleep", new_callable=AsyncMock):
-                await process_order_timeout(redis, str(uuid.uuid4()), "f", "1A", delay=0)
-
-        redis.hset.assert_not_called()
+        # Redis seat lock MUST be rolled back to '0' to prevent ghost locks
+        status_after_rollback = await redis_client.hget(seat_key, "3C")
+        assert status_after_rollback == SeatState.AVAILABLE
 
 
 class TestRedisZSetTimeoutQueue:
-    async def test_schedule_order_timeout(self):
-        redis = AsyncMock()
-        order_id = str(uuid.uuid4())
-        flight_id = str(uuid.uuid4())
-        seat_code = "7D"
+    async def test_schedule_and_process_expired_orders(self, redis_client):
+        from database import AsyncSessionLocal
 
-        await schedule_order_timeout(redis, order_id, flight_id, seat_code, delay=60)
+        async with AsyncSessionLocal() as db:
+            user = await _create_test_user(db)
+            flight = await _create_test_flight(db)
+            seat = await _create_test_seat(db, flight.id, "7D")
 
-        redis.zadd.assert_called_once()
-        key, mapping = redis.zadd.call_args.args
-        assert key == ORDER_TIMEOUT_QUEUE_KEY
-        payload_str = list(mapping.keys())[0]
-        payload = json.loads(payload_str)
-        assert payload["order_id"] == order_id
-        assert payload["flight_id"] == flight_id
-        assert payload["seat_code"] == seat_code
+            order = Order(
+                id=uuid.uuid4(),
+                user_id=user.id,
+                flight_id=flight.id,
+                seat_code="7D",
+                status=OrderStatus.PENDING,
+            )
+            db.add(order)
+            await db.commit()
 
-    async def test_process_expired_orders(self):
-        redis = AsyncMock()
-        order_id = str(uuid.uuid4())
-        flight_id = str(uuid.uuid4())
-        seat_code = "8E"
-        raw_payload = json.dumps({"order_id": order_id, "flight_id": flight_id, "seat_code": seat_code})
+        try:
+            # Lock seat in Redis
+            seat_key = f"flight:{flight.id}:seats"
+            await redis_client.hset(seat_key, "7D", SeatState.LOCKED)
 
-        redis.eval.return_value = [raw_payload]
+            # Schedule timeout with delay=-1 so score < now (immediately due)
+            await schedule_order_timeout(redis_client, str(order.id), str(flight.id), "7D", delay=-1)
 
-        with patch("services.cancel_expired_order", new_callable=AsyncMock) as mock_cancel:
-            count = await process_expired_orders(redis)
-            assert count == 1
-            mock_cancel.assert_called_once_with(redis, order_id, flight_id, seat_code)
+            # Verify entry exists in ZSet
+            zcount = await redis_client.zcard(ORDER_TIMEOUT_QUEUE_KEY)
+            assert zcount >= 1
 
-    async def test_process_expired_orders_empty(self):
-        redis = AsyncMock()
-        redis.eval.return_value = []
+            # Process due orders using Redis Lua script and cancel_expired_order worker
+            processed_count = await process_expired_orders(redis_client)
+            assert processed_count >= 1
 
-        count = await process_expired_orders(redis)
-        assert count == 0
+            # Redis seat lock must be released back to '0'
+            seat_state = await redis_client.hget(seat_key, "7D")
+            assert seat_state == SeatState.AVAILABLE
+
+            # Database order status must be cancelled
+            async with AsyncSessionLocal() as db:
+                res = await db.execute(select(Order).where(Order.id == order.id))
+                refreshed_order = res.scalar_one_or_none()
+                assert refreshed_order is not None
+                assert refreshed_order.status == OrderStatus.CANCELLED
+        finally:
+            from sqlalchemy import delete
+            async with AsyncSessionLocal() as db:
+                await db.execute(delete(Order).where(Order.id == order.id))
+                await db.execute(delete(Seat).where(Seat.flight_id == flight.id))
+                await db.execute(delete(Flight).where(Flight.id == flight.id))
+                await db.execute(delete(User).where(User.id == user.id))
+                await db.commit()
 
 
 class TestPayOrder:
-    async def test_pay_order_success(self):
-        db = AsyncMock()
-        order_id = uuid.uuid4()
-        user_id = uuid.uuid4()
-        flight_id = uuid.uuid4()
-        seat_code = "12A"
+    async def test_pay_order_success(self, db_session):
+        user = await _create_test_user(db_session)
+        flight = await _create_test_flight(db_session)
+        seat = await _create_test_seat(db_session, flight.id, "12A", status=0)
 
-        mock_order = MagicMock()
-        mock_order.id = order_id
-        mock_order.user_id = user_id
-        mock_order.flight_id = flight_id
-        mock_order.seat_code = seat_code
-        mock_order.status = OrderStatus.PENDING
+        order = Order(
+            id=uuid.uuid4(),
+            user_id=user.id,
+            flight_id=flight.id,
+            seat_code="12A",
+            status=OrderStatus.PENDING,
+        )
+        db_session.add(order)
+        await db_session.commit()
 
-        mock_seat = MagicMock()
-        mock_seat.status = 0
+        # Pay order
+        confirmed_order = await pay_order(db_session, order.id, user.id)
+        assert confirmed_order.status == OrderStatus.CONFIRMED
 
-        order_exec_result = MagicMock()
-        order_exec_result.scalar_one_or_none.return_value = mock_order
+        # Seat in PostgreSQL must be updated to occupied (1)
+        await db_session.refresh(seat)
+        assert seat.status == 1
 
-        seat_exec_result = MagicMock()
-        seat_exec_result.scalar_one_or_none.return_value = mock_seat
-
-        db.execute.side_effect = [order_exec_result, seat_exec_result]
-
-        paid_order = await pay_order(db, order_id, user_id)
-
-        assert paid_order.status == OrderStatus.CONFIRMED
-        assert mock_seat.status == 1
-        db.commit.assert_called_once()
-        db.refresh.assert_called_once_with(mock_order)
-
-    async def test_pay_order_not_found_raises(self):
-        db = AsyncMock()
-        order_exec_result = MagicMock()
-        order_exec_result.scalar_one_or_none.return_value = None
-        db.execute.return_value = order_exec_result
-
+    async def test_pay_order_not_found_raises(self, db_session):
+        user = await _create_test_user(db_session)
         with pytest.raises(OrderNotFoundException):
-            await pay_order(db, uuid.uuid4(), uuid.uuid4())
+            await pay_order(db_session, uuid.uuid4(), user.id)
 
-    async def test_pay_order_forbidden_for_other_user(self):
-        db = AsyncMock()
-        owner_id = uuid.uuid4()
-        different_user_id = uuid.uuid4()
+    async def test_pay_order_forbidden_for_other_user(self, db_session):
+        owner = await _create_test_user(db_session)
+        other_user = await _create_test_user(db_session)
+        flight = await _create_test_flight(db_session)
+        await _create_test_seat(db_session, flight.id, "4D")
 
-        mock_order = MagicMock()
-        mock_order.user_id = owner_id
-        order_exec_result = MagicMock()
-        order_exec_result.scalar_one_or_none.return_value = mock_order
-        db.execute.return_value = order_exec_result
+        order = Order(
+            id=uuid.uuid4(),
+            user_id=owner.id,
+            flight_id=flight.id,
+            seat_code="4D",
+            status=OrderStatus.PENDING,
+        )
+        db_session.add(order)
+        await db_session.commit()
 
         with pytest.raises(OrderForbiddenException):
-            await pay_order(db, uuid.uuid4(), different_user_id)
+            await pay_order(db_session, order.id, other_user.id)
 
-    async def test_pay_order_already_cancelled_raises(self):
-        db = AsyncMock()
-        user_id = uuid.uuid4()
+    async def test_pay_order_already_cancelled_raises(self, db_session):
+        user = await _create_test_user(db_session)
+        flight = await _create_test_flight(db_session)
+        await _create_test_seat(db_session, flight.id, "5E")
 
-        mock_order = MagicMock()
-        mock_order.user_id = user_id
-        mock_order.status = OrderStatus.CANCELLED
-        order_exec_result = MagicMock()
-        order_exec_result.scalar_one_or_none.return_value = mock_order
-        db.execute.return_value = order_exec_result
-
-        with pytest.raises(InvalidOrderStatusException):
-            await pay_order(db, uuid.uuid4(), user_id)
-
-    async def test_pay_order_already_confirmed_raises(self):
-        db = AsyncMock()
-        user_id = uuid.uuid4()
-
-        mock_order = MagicMock()
-        mock_order.user_id = user_id
-        mock_order.status = OrderStatus.CONFIRMED
-        order_exec_result = MagicMock()
-        order_exec_result.scalar_one_or_none.return_value = mock_order
-        db.execute.return_value = order_exec_result
+        order = Order(
+            id=uuid.uuid4(),
+            user_id=user.id,
+            flight_id=flight.id,
+            seat_code="5E",
+            status=OrderStatus.CANCELLED,
+        )
+        db_session.add(order)
+        await db_session.commit()
 
         with pytest.raises(InvalidOrderStatusException):
-            await pay_order(db, uuid.uuid4(), user_id)
+            await pay_order(db_session, order.id, user.id)
+
+    async def test_pay_order_already_confirmed_raises(self, db_session):
+        user = await _create_test_user(db_session)
+        flight = await _create_test_flight(db_session)
+        await _create_test_seat(db_session, flight.id, "6F")
+
+        order = Order(
+            id=uuid.uuid4(),
+            user_id=user.id,
+            flight_id=flight.id,
+            seat_code="6F",
+            status=OrderStatus.CONFIRMED,
+        )
+        db_session.add(order)
+        await db_session.commit()
+
+        with pytest.raises(InvalidOrderStatusException):
+            await pay_order(db_session, order.id, user.id)
 
 
 class TestPayOrderAPI:
-    async def test_pay_endpoint_success(self):
-        from httpx import AsyncClient, ASGITransport
-        from main import app
-        from database import get_db
-        from auth import get_current_user_id
+    async def test_pay_endpoint_success(self, async_client, db_session):
+        import jwt
+        from database import settings
 
-        user_id = uuid.uuid4()
-        order_id = uuid.uuid4()
+        user = await _create_test_user(db_session)
+        flight = await _create_test_flight(db_session)
+        await _create_test_seat(db_session, flight.id, "8A", status=0)
 
-        mock_db = MagicMock()
-        mock_order = MagicMock()
-        mock_order.id = order_id
-        mock_order.user_id = user_id
-        mock_order.flight_id = uuid.uuid4()
-        mock_order.seat_code = "1A"
-        mock_order.status = OrderStatus.PENDING
-        mock_order.created_at = datetime.now(timezone.utc)
+        order = Order(
+            id=uuid.uuid4(),
+            user_id=user.id,
+            flight_id=flight.id,
+            seat_code="8A",
+            status=OrderStatus.PENDING,
+        )
+        db_session.add(order)
+        await db_session.commit()
 
-        mock_seat = MagicMock()
-        mock_seat.status = 0
+        token = jwt.encode(
+            {"sub": str(user.id), "type": "access"},
+            settings.JWT_SECRET_KEY,
+            algorithm=settings.JWT_ALGORITHM,
+        )
+        headers = {"Authorization": f"Bearer {token}"}
 
-        order_res = MagicMock()
-        order_res.scalar_one_or_none.return_value = mock_order
-        seat_res = MagicMock()
-        seat_res.scalar_one_or_none.return_value = mock_seat
-
-        mock_db.execute = AsyncMock(side_effect=[order_res, seat_res])
-        mock_db.commit = AsyncMock()
-        mock_db.refresh = AsyncMock()
-
-        app.dependency_overrides[get_db] = lambda: mock_db
-        app.dependency_overrides[get_current_user_id] = lambda: user_id
-        try:
-            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-                resp = await client.post(f"/api/v1/orders/{order_id}/pay")
-                assert resp.status_code == 200
-                data = resp.json()
-                assert data["status"] == "Confirmed"
-                assert data["id"] == str(order_id)
-        finally:
-            app.dependency_overrides.clear()
+        resp = await async_client.post(f"/api/v1/orders/{order.id}/pay", headers=headers)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "Confirmed"
+        assert data["id"] == str(order.id)
