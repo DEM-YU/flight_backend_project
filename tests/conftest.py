@@ -3,14 +3,18 @@ from typing import AsyncGenerator
 import pytest_asyncio
 import redis.asyncio as aioredis
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from database import get_db, get_redis, settings
 from main import app
 from models import Base
+import services
+from sqlalchemy.ext.asyncio import async_sessionmaker
 
 test_engine = create_async_engine(settings.pg_dsn, poolclass=NullPool)
+services.AsyncSessionLocal = async_sessionmaker(bind=test_engine, expire_on_commit=False)
 
 
 @pytest_asyncio.fixture(autouse=True)

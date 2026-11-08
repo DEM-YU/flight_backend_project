@@ -9,11 +9,13 @@ from auth import hash_password
 from models import Flight, Order, OrderStatus, Seat, SeatState, User
 from services import (
     ORDER_TIMEOUT_QUEUE_KEY,
+    AsyncSessionLocal,
     InvalidOrderStatusException,
     OrderForbiddenException,
     OrderNotFoundException,
     SeatNotFoundException,
     SeatUnavailableException,
+    cancel_expired_order,
     pay_order,
     process_expired_orders,
     reserve_seat,
@@ -333,3 +335,90 @@ class TestPayOrderAPI:
         data = resp.json()
         assert data["status"] == "Confirmed"
         assert data["id"] == str(order.id)
+
+
+class TestPayAndCancelConcurrency:
+    async def test_worker_skips_seat_release_if_order_already_paid(self, redis_client):
+        """Verify atomic CAS: If user paid, timeout worker must not release Redis seat."""
+        async with AsyncSessionLocal() as db:
+            user = await _create_test_user(db)
+            flight = await _create_test_flight(db)
+            seat = await _create_test_seat(db, flight.id, "10A", status=0)
+            order = Order(
+                id=uuid.uuid4(),
+                user_id=user.id,
+                flight_id=flight.id,
+                seat_code="10A",
+                status=OrderStatus.PENDING,
+            )
+            db.add(order)
+            await db.commit()
+
+        seat_key = f"flight:{flight.id}:seats"
+        await redis_client.hset(seat_key, "10A", SeatState.LOCKED)
+
+        try:
+            # 1. User pays the order -> status becomes CONFIRMED
+            async with AsyncSessionLocal() as db:
+                await pay_order(db, order.id, user.id)
+
+            # 2. Worker attempts to cancel -> CAS fails because status is not PENDING
+            cancelled = await cancel_expired_order(
+                redis_client, str(order.id), str(flight.id), "10A"
+            )
+            assert cancelled is False
+
+            # 3. Redis seat must REMAIN LOCKED, NOT released to AVAILABLE ('0')
+            redis_seat_status = await redis_client.hget(seat_key, "10A")
+            assert redis_seat_status == SeatState.LOCKED
+        finally:
+            from sqlalchemy import delete
+            async with AsyncSessionLocal() as db:
+                await db.execute(delete(Order).where(Order.id == order.id))
+                await db.execute(delete(Seat).where(Seat.flight_id == flight.id))
+                await db.execute(delete(Flight).where(Flight.id == flight.id))
+                await db.execute(delete(User).where(User.id == user.id))
+                await db.commit()
+
+    async def test_pay_fails_if_worker_already_cancelled_order(self, redis_client):
+        """Verify atomic CAS: If timeout worker cancelled order, payment attempt must fail."""
+        async with AsyncSessionLocal() as db:
+            user = await _create_test_user(db)
+            flight = await _create_test_flight(db)
+            seat = await _create_test_seat(db, flight.id, "11B", status=0)
+            order = Order(
+                id=uuid.uuid4(),
+                user_id=user.id,
+                flight_id=flight.id,
+                seat_code="11B",
+                status=OrderStatus.PENDING,
+            )
+            db.add(order)
+            await db.commit()
+
+        seat_key = f"flight:{flight.id}:seats"
+        await redis_client.hset(seat_key, "11B", SeatState.LOCKED)
+
+        try:
+            # 1. Worker auto-cancels the order -> status becomes CANCELLED
+            cancelled = await cancel_expired_order(
+                redis_client, str(order.id), str(flight.id), "11B"
+            )
+            assert cancelled is True
+
+            # 2. Redis seat must be released to AVAILABLE ('0')
+            redis_seat_status = await redis_client.hget(seat_key, "11B")
+            assert redis_seat_status == SeatState.AVAILABLE
+
+            # 3. User attempts to pay afterwards -> atomic CAS fails and raises exception
+            async with AsyncSessionLocal() as db:
+                with pytest.raises(InvalidOrderStatusException):
+                    await pay_order(db, order.id, user.id)
+        finally:
+            from sqlalchemy import delete
+            async with AsyncSessionLocal() as db:
+                await db.execute(delete(Order).where(Order.id == order.id))
+                await db.execute(delete(Seat).where(Seat.flight_id == flight.id))
+                await db.execute(delete(Flight).where(Flight.id == flight.id))
+                await db.execute(delete(User).where(User.id == user.id))
+                await db.commit()

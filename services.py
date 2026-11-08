@@ -7,7 +7,8 @@ from datetime import date, datetime, timedelta, timezone
 from uuid import UUID
 
 import redis.asyncio as aioredis
-from sqlalchemy import select
+from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import AsyncSessionLocal
@@ -187,19 +188,23 @@ async def cancel_expired_order(
     seat_code: str,
 ) -> bool:
     async with AsyncSessionLocal() as db:
-        order = (
-            await db.execute(select(Order).where(Order.id == UUID(order_id)))
-        ).scalar_one_or_none()
+        # Atomic CAS: Only cancel if order is still strictly PENDING.
+        # If the user paid concurrently, rowcount will be 0 and seat release is skipped.
+        stmt = (
+            update(Order)
+            .where(Order.id == UUID(order_id), Order.status == OrderStatus.PENDING)
+            .values(status=OrderStatus.CANCELLED)
+        )
+        result = await db.execute(stmt)
+        await db.commit()
 
-        if order is None or order.status != OrderStatus.PENDING:
+        if result.rowcount == 0:
             logger.info(
-                "Order %s timeout check: status=%s, no action needed",
-                order_id, order.status if order else "NOT_FOUND",
+                "Order %s timeout check: order not found or already processed (paid/cancelled), skipping seat release",
+                order_id,
             )
             return False
 
-        order.status = OrderStatus.CANCELLED
-        await db.commit()
         logger.info("Order %s auto-cancelled by timeout worker", order_id)
 
     seat_key = f"flight:{flight_id}:seats"
@@ -298,20 +303,26 @@ async def pay_order(
     if order.user_id != user_id:
         raise OrderForbiddenException("You do not have permission to pay for this order.")
 
-    if order.status != OrderStatus.PENDING:
-        raise InvalidOrderStatusException(
-            f"Order {order_id} cannot be paid. Current status: {order.status}."
-        )
-
-    order.status = OrderStatus.CONFIRMED
-
-    seat_stmt = select(Seat).where(
-        Seat.flight_id == order.flight_id,
-        Seat.seat_code == order.seat_code,
+    # Atomic CAS update: only update if status is still PENDING.
+    # Prevents race condition where the timeout worker auto-cancels concurrently.
+    stmt = (
+        update(Order)
+        .where(Order.id == order_id, Order.status == OrderStatus.PENDING)
+        .values(status=OrderStatus.CONFIRMED)
     )
-    seat = (await db.execute(seat_stmt)).scalar_one_or_none()
-    if seat:
-        seat.status = 1
+    result = await db.execute(stmt)
+    if result.rowcount == 0:
+        raise InvalidOrderStatusException("Order already processed or expired.")
+
+    seat_stmt = (
+        update(Seat)
+        .where(
+            Seat.flight_id == order.flight_id,
+            Seat.seat_code == order.seat_code,
+        )
+        .values(status=1)
+    )
+    await db.execute(seat_stmt)
 
     await db.commit()
     await db.refresh(order)
