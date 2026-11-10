@@ -21,6 +21,13 @@ services.AsyncSessionLocal = async_sessionmaker(bind=test_engine, expire_on_comm
 async def ensure_tables():
     async with test_engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.execute(
+            text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_flight_seat_active_order "
+                "ON orders (flight_id, seat_code) "
+                "WHERE status IN ('Pending', 'Confirmed');"
+            )
+        )
 
 
 @pytest_asyncio.fixture

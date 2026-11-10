@@ -24,6 +24,13 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.execute(
+            text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_flight_seat_active_order "
+                "ON orders (flight_id, seat_code) "
+                "WHERE status IN ('Pending', 'Confirmed');"
+            )
+        )
 
     worker_redis = aioredis.Redis(connection_pool=redis_pool)
     worker_task = asyncio.create_task(run_timeout_worker(worker_redis))

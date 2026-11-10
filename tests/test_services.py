@@ -163,6 +163,34 @@ class TestReserveSeat:
         status_after_rollback = await redis_client.hget(seat_key, "3C")
         assert status_after_rollback == SeatState.AVAILABLE
 
+    async def test_database_partial_unique_index_prevents_duplicate_active_orders(
+        self, db_session, redis_client
+    ):
+        """Defensive Baseline: If Redis desyncs, PostgreSQL unique constraint catches duplicate active orders."""
+        user1 = await _create_test_user(db_session)
+        user2 = await _create_test_user(db_session)
+        flight = await _create_test_flight(db_session)
+        await _create_test_seat(db_session, flight.id, "5A")
+
+        seat_key = f"flight:{flight.id}:seats"
+        await redis_client.hset(seat_key, "5A", SeatState.AVAILABLE)
+
+        # 1. First user reserves seat 5A -> succeeds in Redis and PostgreSQL
+        order1 = await reserve_seat(db_session, redis_client, user1.id, flight.id, "5A")
+        assert order1.status == OrderStatus.PENDING
+
+        # 2. Simulate Redis desync / split-brain: Redis seat is mistakenly reset to AVAILABLE
+        await redis_client.hset(seat_key, "5A", SeatState.AVAILABLE)
+
+        # 3. Second user attempts to reserve the same seat:
+        # Redis Lua check passes, but PostgreSQL partial unique index blocks the insert
+        with pytest.raises(SeatUnavailableException):
+            await reserve_seat(db_session, redis_client, user2.id, flight.id, "5A")
+
+        # 4. Redis seat must be corrected back to LOCKED to prevent further invalid attempts
+        seat_status = await redis_client.hget(seat_key, "5A")
+        assert seat_status == SeatState.LOCKED
+
 
 class TestRedisZSetTimeoutQueue:
     async def test_schedule_and_process_expired_orders(self, redis_client):

@@ -154,6 +154,27 @@ async def reserve_seat(
             seat_code, flight_id, user_id, order.id,
         )
         return order
+    except IntegrityError as exc:
+        await db.rollback()
+        err_msg = str(exc).lower()
+        if "uq_flight_seat_active_order" in err_msg or "unique" in err_msg:
+            logger.warning(
+                "Database rejected reservation for seat %s on flight %s due to duplicate active order: %s",
+                seat_code, flight_id, exc,
+            )
+            # Defensive baseline: Seat is already booked in PostgreSQL. Sync Redis to LOCKED.
+            await redis.hset(seat_key, seat_code, SeatState.LOCKED)
+            raise SeatUnavailableException(
+                f"Seat {seat_code} on flight {flight_id} is unavailable."
+            ) from exc
+        else:
+            # Foreign key or other integrity error: seat is NOT booked in DB, rollback Redis lock
+            logger.error(
+                "DB integrity violation for seat %s on flight %s, rolling back Redis lock: %s",
+                seat_code, flight_id, exc,
+            )
+            await redis.hset(seat_key, seat_code, SeatState.AVAILABLE)
+            raise
     except Exception:
         logger.error(
             "DB commit failed for seat %s on flight %s, rolling back Redis lock",

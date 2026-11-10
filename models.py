@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, UniqueConstraint
+from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, Integer, String, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -58,6 +58,7 @@ class Seat(Base):
     __tablename__ = "seats"
     __table_args__ = (
         UniqueConstraint("flight_id", "seat_code", name="uq_seat_flight_seat_code"),
+        CheckConstraint("status IN (0, 1)", name="chk_seat_status"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -74,6 +75,15 @@ class Order(Base):
     __tablename__ = "orders"
     __table_args__ = (
         Index("ix_order_status_created", "status", "created_at"),
+        # Defensive database baseline: partial unique index guaranteeing that for any given flight and seat,
+        # there can only be ONE active (Pending or Confirmed) order at any time.
+        Index(
+            "uq_flight_seat_active_order",
+            "flight_id",
+            "seat_code",
+            unique=True,
+            postgresql_where=text("status IN ('Pending', 'Confirmed')"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(
