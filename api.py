@@ -103,10 +103,11 @@ async def reserve_flight_seat(
 async def pay_flight_order(
     order_id: uuid.UUID,
     db: Annotated[AsyncSession, Depends(get_db)],
+    redis: Annotated[aioredis.Redis, Depends(get_redis)],
     user_id: Annotated[uuid.UUID, Depends(get_current_user_id)],
 ) -> OrderResponse:
     try:
-        order = await pay_order(db, order_id, user_id)
+        order = await pay_order(db, order_id, user_id, redis=redis)
     except OrderNotFoundException as e:
         raise HTTPException(status_code=404, detail=str(e))
     except OrderForbiddenException as e:

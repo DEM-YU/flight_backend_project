@@ -376,22 +376,11 @@ async def run_timeout_worker(
         logger.info("Stopped Redis ZSet timeout cancellation worker.")
 
 
-async def process_order_timeout(
-    redis: aioredis.Redis,
-    order_id: str,
-    flight_id: str,
-    seat_code: str,
-    delay: int = _ORDER_TIMEOUT_SECONDS,
-) -> None:
-    # Kept for backward compatibility with earlier tests
-    await asyncio.sleep(delay)
-    await cancel_expired_order(redis, order_id, flight_id, seat_code)
-
-
 async def pay_order(
     db: AsyncSession,
     order_id: UUID,
     user_id: UUID,
+    redis: aioredis.Redis | None = None,
 ) -> Order:
     order = (
         await db.execute(select(Order).where(Order.id == order_id))
@@ -427,4 +416,20 @@ async def pay_order(
     await db.commit()
     await db.refresh(order)
     logger.info("Order %s confirmed and paid by user %s", order_id, user_id)
+
+    # Proactively remove the task from Redis ZSet timeout queue to avoid worker polling overhead
+    if redis is not None:
+        order_task = json.dumps({
+            "order_id": str(order.id),
+            "flight_id": str(order.flight_id),
+            "seat_code": order.seat_code,
+        })
+        try:
+            await redis.zrem(ORDER_TIMEOUT_QUEUE_KEY, order_task)
+            logger.info("Order %s removed from Redis timeout queue after payment", order.id)
+        except Exception:
+            logger.warning(
+                "Failed to remove paid order %s from timeout queue", order.id, exc_info=True
+            )
+
     return order

@@ -413,6 +413,41 @@ class TestPayOrder:
         with pytest.raises(InvalidOrderStatusException):
             await pay_order(db_session, order.id, user.id)
 
+    async def test_pay_order_removes_task_from_timeout_queue(self, db_session, redis_client):
+        """Verify Resource Cleanup: Paying an order proactively deletes it from Redis ZSet timeout queue."""
+        user = await _create_test_user(db_session)
+        flight = await _create_test_flight(db_session)
+        await _create_test_seat(db_session, flight.id, "14B", status=0)
+
+        order = Order(
+            id=uuid.uuid4(),
+            user_id=user.id,
+            flight_id=flight.id,
+            seat_code="14B",
+            status=OrderStatus.PENDING,
+        )
+        db_session.add(order)
+        await db_session.commit()
+
+        # 1. Schedule order timeout in Redis ZSet delay queue
+        await schedule_order_timeout(redis_client, str(order.id), str(flight.id), "14B")
+
+        # Verify task exists in ZSet
+        initial_count = await redis_client.zcard(ORDER_TIMEOUT_QUEUE_KEY)
+        assert initial_count >= 1
+
+        # 2. Pay order passing redis client
+        await pay_order(db_session, order.id, user.id, redis=redis_client)
+
+        # 3. Verify task was physically deleted from Redis ZSet queue
+        task_payload = json.dumps({
+            "order_id": str(order.id),
+            "flight_id": str(flight.id),
+            "seat_code": "14B",
+        })
+        score = await redis_client.zscore(ORDER_TIMEOUT_QUEUE_KEY, task_payload)
+        assert score is None
+
 
 class TestPayOrderAPI:
     async def test_pay_endpoint_success(self, async_client, db_session):
