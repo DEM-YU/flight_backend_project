@@ -10,12 +10,14 @@ from models import Flight, Order, OrderStatus, Seat, SeatState, User
 from services import (
     ORDER_TIMEOUT_QUEUE_KEY,
     AsyncSessionLocal,
+    FlightNotFoundException,
     InvalidOrderStatusException,
     OrderForbiddenException,
     OrderNotFoundException,
     SeatNotFoundException,
     SeatUnavailableException,
     cancel_expired_order,
+    get_flight_seat_map,
     pay_order,
     process_expired_orders,
     reserve_seat,
@@ -101,6 +103,86 @@ class TestSearchFlights:
         cache_key = f"route:NON:EXIST:{today.isoformat()}"
         ttl = await redis_client.ttl(cache_key)
         assert 0 < ttl <= 60
+
+
+class TestFlightSeatMap:
+    async def test_get_seat_map_cache_miss_hydrates_from_postgres_and_populates_redis(
+        self, db_session, redis_client
+    ):
+        """Verify Cache-Aside: When Redis is empty, query loads seats from PostgreSQL and populates Redis."""
+        flight = await _create_test_flight(db_session)
+        await _create_test_seat(db_session, flight.id, "1A", status=0)
+        await _create_test_seat(db_session, flight.id, "1B", status=0)
+
+        seat_key = f"flight:{flight.id}:seats"
+        # Ensure Redis has no cache initially
+        await redis_client.delete(seat_key)
+
+        # 1. Query seat map -> triggers cache miss and auto-hydrates from PostgreSQL
+        seat_map = await get_flight_seat_map(db_session, redis_client, flight.id)
+        assert seat_map.flight_id == flight.id
+        assert seat_map.total_seats == 2
+        assert seat_map.available_seats == 2
+        assert [s.seat_code for s in seat_map.seats] == ["1A", "1B"]
+        assert all(s.is_available for s in seat_map.seats)
+
+        # 2. Verify Redis Hash was physically populated
+        cached_seats = await redis_client.hgetall(seat_key)
+        assert cached_seats == {"1A": "0", "1B": "0"}
+
+    async def test_get_seat_map_reflects_locked_seats(self, db_session, redis_client):
+        """Verify seat map returns accurate availability when a seat is locked in Redis."""
+        flight = await _create_test_flight(db_session)
+        seat_key = f"flight:{flight.id}:seats"
+        await redis_client.hset(seat_key, mapping={"1A": "1", "1B": "0"})
+
+        seat_map = await get_flight_seat_map(db_session, redis_client, flight.id)
+        assert seat_map.total_seats == 2
+        assert seat_map.available_seats == 1
+
+        seat_1a = next(s for s in seat_map.seats if s.seat_code == "1A")
+        seat_1b = next(s for s in seat_map.seats if s.seat_code == "1B")
+        assert seat_1a.is_available is False
+        assert seat_1a.status == 1
+        assert seat_1b.is_available is True
+        assert seat_1b.status == 0
+
+    async def test_get_seat_map_non_existent_flight_raises_404(self, db_session, redis_client):
+        fake_id = uuid.uuid4()
+        with pytest.raises(FlightNotFoundException):
+            await get_flight_seat_map(db_session, redis_client, fake_id)
+
+    async def test_reserve_seat_auto_hydrates_when_redis_empty(self, db_session, redis_client):
+        """Verify Cache-Aside on reserve: Even if Redis is blank, reserve_seat loads DB seats and succeeds."""
+        user = await _create_test_user(db_session)
+        flight = await _create_test_flight(db_session)
+        await _create_test_seat(db_session, flight.id, "2C", status=0)
+
+        seat_key = f"flight:{flight.id}:seats"
+        # Make sure Redis has no key
+        await redis_client.delete(seat_key)
+
+        # Reserve seat without prior seeding in Redis -> auto-hydrates and succeeds
+        order = await reserve_seat(db_session, redis_client, user.id, flight.id, "2C")
+        assert order.status == OrderStatus.PENDING
+        assert order.seat_code == "2C"
+
+        # Verify Redis now has the seat locked
+        status_in_redis = await redis_client.hget(seat_key, "2C")
+        assert status_in_redis == SeatState.LOCKED
+
+    async def test_api_get_seats_endpoint_success(self, async_client, db_session, redis_client):
+        flight = await _create_test_flight(db_session)
+        await _create_test_seat(db_session, flight.id, "3A", status=0)
+
+        resp = await async_client.get(f"/api/v1/flights/{flight.id}/seats")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["flight_id"] == str(flight.id)
+        assert data["total_seats"] == 1
+        assert data["available_seats"] == 1
+        assert data["seats"][0]["seat_code"] == "3A"
+        assert data["seats"][0]["is_available"] is True
 
 
 class TestReserveSeat:

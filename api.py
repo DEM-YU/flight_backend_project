@@ -7,15 +7,17 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db, get_redis, settings
-from models import FlightResponse, OrderResponse, ReserveRequest
+from models import FlightResponse, FlightSeatMapResponse, OrderResponse, ReserveRequest
 from auth import get_current_user_id
 from rate_limiter import RateLimiter
 from services import (
+    FlightNotFoundException,
     InvalidOrderStatusException,
     OrderForbiddenException,
     OrderNotFoundException,
     SeatNotFoundException,
     SeatUnavailableException,
+    get_flight_seat_map,
     pay_order,
     reserve_seat,
     schedule_order_timeout,
@@ -46,6 +48,18 @@ async def list_flights(
     response.headers["X-Cache-Status"] = "HIT" if is_from_cache else "MISS"
 
     return flights
+
+
+@router.get("/flights/{flight_id}/seats", response_model=FlightSeatMapResponse)
+async def get_flight_seats(
+    flight_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    redis: Annotated[aioredis.Redis, Depends(get_redis)],
+) -> FlightSeatMapResponse:
+    try:
+        return await get_flight_seat_map(db, redis, flight_id)
+    except FlightNotFoundException as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
 
 
 @router.post(

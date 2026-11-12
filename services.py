@@ -12,7 +12,16 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import AsyncSessionLocal
-from models import FlightResponse, OrderStatus, SeatState, Flight, Order, Seat
+from models import (
+    Flight,
+    FlightResponse,
+    FlightSeatMapResponse,
+    Order,
+    OrderStatus,
+    Seat,
+    SeatResponse,
+    SeatState,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +44,10 @@ return items
 """
 
 
+
+
+class FlightNotFoundException(Exception):
+    pass
 
 
 class SeatUnavailableException(Exception):
@@ -118,6 +131,63 @@ async def search_flights(
     return flight_responses, False
 
 
+def _seat_sort_key(code: str) -> tuple[int, str]:
+    digits = "".join(ch for ch in code if ch.isdigit())
+    num = int(digits) if digits else 0
+    return (num, code)
+
+
+async def get_flight_seat_map(
+    db: AsyncSession,
+    redis: aioredis.Redis,
+    flight_id: UUID,
+) -> FlightSeatMapResponse:
+    seat_key = f"flight:{flight_id}:seats"
+    seat_map = await redis.hgetall(seat_key)
+
+    if not seat_map:
+        # Cache miss: query PostgreSQL for flight and seats
+        flight = (
+            await db.execute(select(Flight).where(Flight.id == flight_id))
+        ).scalar_one_or_none()
+        if flight is None:
+            raise FlightNotFoundException(f"Flight {flight_id} not found.")
+
+        seats = (
+            await db.execute(
+                select(Seat).where(Seat.flight_id == flight_id)
+            )
+        ).scalars().all()
+
+        if seats:
+            seat_map = {s.seat_code: str(s.status) for s in seats}
+            await redis.hset(seat_key, mapping=seat_map)
+        else:
+            seat_map = {}
+
+    seat_list = []
+    available_count = 0
+    for code in sorted(seat_map.keys(), key=_seat_sort_key):
+        status_val = int(seat_map[code])
+        is_avail = (status_val == 0)
+        if is_avail:
+            available_count += 1
+        seat_list.append(
+            SeatResponse(
+                seat_code=code,
+                status=status_val,
+                is_available=is_avail,
+            )
+        )
+
+    return FlightSeatMapResponse(
+        flight_id=flight_id,
+        total_seats=len(seat_list),
+        available_seats=available_count,
+        seats=seat_list,
+    )
+
+
 async def reserve_seat(
     db: AsyncSession,
     redis: aioredis.Redis,
@@ -128,6 +198,15 @@ async def reserve_seat(
     seat_key = f"flight:{flight_id}:seats"
 
     lock_status = await redis.eval(RESERVE_SEAT_SCRIPT, 1, seat_key, seat_code)
+    if lock_status == -1:
+        # Cache-Aside: Seat map may not be in Redis yet (e.g. server restart or new flight).
+        # Hydrate seat map from PostgreSQL and retry atomic locking once.
+        try:
+            await get_flight_seat_map(db, redis, flight_id)
+            lock_status = await redis.eval(RESERVE_SEAT_SCRIPT, 1, seat_key, seat_code)
+        except FlightNotFoundException:
+            pass
+
     if lock_status == -1:
         raise SeatNotFoundException(
             f"Seat {seat_code} does not exist on flight {flight_id}."

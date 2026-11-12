@@ -117,6 +117,21 @@ class FlightResponse(BaseModel):
     departure_time: datetime
 
 
+class SeatResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    seat_code: str
+    status: int
+    is_available: bool
+
+
+class FlightSeatMapResponse(BaseModel):
+    flight_id: uuid.UUID
+    total_seats: int
+    available_seats: int
+    seats: list[SeatResponse]
+
+
 class ReserveRequest(BaseModel):
     flight_id: uuid.UUID
     seat_code: str
