@@ -46,28 +46,64 @@ return items
 
 
 
-class FlightNotFoundException(Exception):
-    pass
+class BookingDomainException(Exception):
+    status_code: int = 500
+    detail: str = "Internal server error"
+
+    def __init__(self, detail: str | None = None):
+        if detail:
+            self.detail = detail
+        super().__init__(self.detail)
 
 
-class SeatUnavailableException(Exception):
-    pass
+class NotFoundException(BookingDomainException):
+    status_code: int = 404
+    detail: str = "Resource not found"
 
 
-class SeatNotFoundException(Exception):
-    pass
+class ConflictException(BookingDomainException):
+    status_code: int = 409
+    detail: str = "Resource conflict"
 
 
-class OrderNotFoundException(Exception):
-    pass
+class ForbiddenException(BookingDomainException):
+    status_code: int = 403
+    detail: str = "Access forbidden"
 
 
-class OrderForbiddenException(Exception):
-    pass
+class BadRequestException(BookingDomainException):
+    status_code: int = 400
+    detail: str = "Bad request"
 
 
-class InvalidOrderStatusException(Exception):
-    pass
+class FlightNotFoundException(NotFoundException):
+    def __init__(self, flight_id: str | UUID):
+        super().__init__(f"Flight {flight_id} not found.")
+
+
+class SeatUnavailableException(ConflictException):
+    def __init__(self, detail: str = "Seat is already reserved or unavailable."):
+        super().__init__(detail)
+
+
+class SeatNotFoundException(NotFoundException):
+    def __init__(self, detail: str = "Seat does not exist or flight seat map is not initialized."):
+        super().__init__(detail)
+
+
+class OrderNotFoundException(NotFoundException):
+    def __init__(self, order_id: str | UUID):
+        super().__init__(f"Order {order_id} not found.")
+
+
+class OrderForbiddenException(ForbiddenException):
+    def __init__(self, detail: str = "You do not have permission to pay for this order."):
+        super().__init__(detail)
+
+
+class InvalidOrderStatusException(BadRequestException):
+    def __init__(self, detail: str = "Order already processed or expired."):
+        super().__init__(detail)
 
 
 # Lua check-and-set: HGET nil means seat was never initialized, distinct from

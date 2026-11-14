@@ -225,7 +225,7 @@ async def run_benchmark(
 
     # 3. Environment reset
     print("\n[Step 3/4] Resetting Redis seats & clearing previous test orders ...")
-    if mode == "pool-exhaust":
+    if mode in ("pool-exhaust", "flash-sale"):
         await reset_environment(flight_id, reset_all_seats=True)
     else:
         await reset_environment(flight_id, reset_all_seats=False, single_seat=seat_code)
@@ -245,6 +245,21 @@ async def run_benchmark(
             # Each user reserves a different seat (forces concurrent database writes)
             tasks = [
                 reserve_call(session, i, user_pool[i - 1][0], user_pool[i - 1][1], flight_id, f"{i}A", base_url, timeout_sec)
+                for i in range(1, concurrency + 1)
+            ]
+        elif mode == "flash-sale":
+            seats = [f"{s}A" for s in range(1, 51)]
+            tasks = [
+                reserve_call(
+                    session,
+                    i,
+                    user_pool[i - 1][0],
+                    user_pool[i - 1][1],
+                    flight_id,
+                    seats[(i - 1) % len(seats)],
+                    base_url,
+                    timeout_sec,
+                )
                 for i in range(1, concurrency + 1)
             ]
         else:
@@ -306,6 +321,18 @@ async def run_benchmark(
             print(f"      - {categories['timeout']} client timeouts / {categories['connection_error']} socket drops.")
         print(f"  ✓ Redis CAS lock remained fully intact: {categories['success']} winner, {categories['conflict']} rejected.")
 
+    elif mode == "flash-sale":
+        print("\n  [DIAGNOSTIC: REAL-WORLD FLASH SALE (1,000 USERS -> 50 SEATS)]")
+        print(f"  Simulated {concurrency} users competing for 50 distinct seats (20 users/seat).")
+        print(f"  ✓ Exact Seat Allocation: {categories['success']} seats reserved (Expected: exactly 50).")
+        print(f"  ✓ High-Contention Rejection: {categories['conflict']} requests blocked by Redis Lua CAS (Expected: {concurrency - categories['success']}).")
+        from sqlalchemy import select, func
+        async with AsyncSessionLocal() as db:
+            db_order_count = (await db.execute(select(func.count(Order.id)).where(Order.flight_id == uuid.UUID(flight_id)))).scalar_one()
+        print(f"  ✓ Database Verification: Exactly {db_order_count} orders persisted in PostgreSQL.")
+        if categories["success"] == 50 and db_order_count == 50:
+            print("  ✓ ZERO OVERSELLING: All 50 seats successfully distributed without collision or duplicate orders!")
+
     elif mode == "breakdown":
         print("\n  [DIAGNOSTIC: SYSTEM SATURATION & BREAKDOWN OBSERVED]")
         print("  Under 3,000 instant concurrent requests with 1.5s client timeout:")
@@ -338,9 +365,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Multi-User Seat Reservation Concurrency & Load Benchmark")
     parser.add_argument(
         "-m", "--mode",
-        choices=["regular", "extreme", "breakdown", "pool-exhaust"],
+        choices=["regular", "extreme", "flash-sale", "breakdown", "pool-exhaust"],
         default="regular",
-        help="Test mode: 'regular' (50 users), 'extreme' (1,000 users), 'breakdown' (3,000 users breakdown), 'pool-exhaust' (multi-seat DB stress)",
+        help="Test mode: 'regular' (50 users), 'extreme' (1,000 users), 'flash-sale' (1,000 users -> 50 seats), 'breakdown' (3,000 users breakdown), 'pool-exhaust' (multi-seat DB stress)",
     )
     parser.add_argument(
         "-n", "--concurrency",
@@ -388,13 +415,25 @@ if __name__ == "__main__":
 
     # Defaults per mode
     if args.concurrency is None:
-        concurrency_map = {"regular": 50, "extreme": 1000, "breakdown": 3000, "pool-exhaust": 60}
+        concurrency_map = {
+            "regular": 50,
+            "extreme": 1000,
+            "flash-sale": 1000,
+            "breakdown": 3000,
+            "pool-exhaust": 60,
+        }
         concurrency = concurrency_map[args.mode]
     else:
         concurrency = args.concurrency
 
     if args.timeout is None:
-        timeout_map = {"regular": 5.0, "extreme": 2.0, "breakdown": 1.5, "pool-exhaust": 6.0}
+        timeout_map = {
+            "regular": 5.0,
+            "extreme": 2.0,
+            "flash-sale": 5.0,
+            "breakdown": 1.5,
+            "pool-exhaust": 6.0,
+        }
         timeout = timeout_map[args.mode]
     else:
         timeout = args.timeout

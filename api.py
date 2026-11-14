@@ -3,7 +3,7 @@ from datetime import date
 from typing import Annotated
 
 import redis.asyncio as aioredis
-from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import get_db, get_redis, settings
@@ -11,12 +11,6 @@ from models import FlightResponse, FlightSeatMapResponse, OrderResponse, Reserve
 from auth import get_current_user_id
 from rate_limiter import RateLimiter
 from services import (
-    FlightNotFoundException,
-    InvalidOrderStatusException,
-    OrderForbiddenException,
-    OrderNotFoundException,
-    SeatNotFoundException,
-    SeatUnavailableException,
     get_flight_seat_map,
     pay_order,
     reserve_seat,
@@ -56,10 +50,7 @@ async def get_flight_seats(
     db: Annotated[AsyncSession, Depends(get_db)],
     redis: Annotated[aioredis.Redis, Depends(get_redis)],
 ) -> FlightSeatMapResponse:
-    try:
-        return await get_flight_seat_map(db, redis, flight_id)
-    except FlightNotFoundException as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
+    return await get_flight_seat_map(db, redis, flight_id)
 
 
 @router.post(
@@ -74,28 +65,15 @@ async def reserve_flight_seat(
     redis: Annotated[aioredis.Redis, Depends(get_redis)],
     user_id: Annotated[uuid.UUID, Depends(get_current_user_id)],
 ) -> OrderResponse:
-    try:
-        order = await reserve_seat(
-            db, redis, user_id, req.flight_id, req.seat_code
-        )
-    except SeatNotFoundException:
-        raise HTTPException(
-            status_code=404,
-            detail="Seat does not exist or flight seat map is not initialized.",
-        )
-    except SeatUnavailableException:
-        raise HTTPException(
-            status_code=409,
-            detail="Seat is already reserved or unavailable.",
-        )
-
+    order = await reserve_seat(
+        db, redis, user_id, req.flight_id, req.seat_code
+    )
     await schedule_order_timeout(
         redis,
         str(order.id),
         str(req.flight_id),
         req.seat_code,
     )
-
     return OrderResponse.model_validate(order)
 
 
@@ -106,13 +84,5 @@ async def pay_flight_order(
     redis: Annotated[aioredis.Redis, Depends(get_redis)],
     user_id: Annotated[uuid.UUID, Depends(get_current_user_id)],
 ) -> OrderResponse:
-    try:
-        order = await pay_order(db, order_id, user_id, redis=redis)
-    except OrderNotFoundException as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except OrderForbiddenException as e:
-        raise HTTPException(status_code=403, detail=str(e))
-    except InvalidOrderStatusException as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
+    order = await pay_order(db, order_id, user_id, redis=redis)
     return OrderResponse.model_validate(order)

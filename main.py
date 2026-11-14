@@ -15,7 +15,7 @@ from api import router
 from auth_api import router as auth_router
 from database import engine, get_db, get_redis, redis_pool
 from models import Base
-from services import run_timeout_worker
+from services import BookingDomainException, run_timeout_worker
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +72,14 @@ async def redis_exception_handler(request: Request, exc: RedisConnectionError) -
     return JSONResponse(
         status_code=503,
         content={"detail": "Service temporarily unavailable. Please retry."},
+    )
+
+
+@app.exception_handler(BookingDomainException)
+async def domain_exception_handler(request: Request, exc: BookingDomainException) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
     )
 
 
