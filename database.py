@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     POSTGRES_DB: str = "flight_db"
 
     REDIS_URL: str = "redis://localhost:6379"
+    REDIS_MAX_CONNECTIONS: int = 2000
 
     JWT_SECRET_KEY: str = "super-secret-key-change-me-in-production-123456"
     JWT_ALGORITHM: str = "HS256"
@@ -51,7 +52,7 @@ AsyncSessionLocal = async_sessionmaker(
 
 redis_pool = aioredis.ConnectionPool.from_url(
     settings.REDIS_URL,
-    max_connections=50,
+    max_connections=settings.REDIS_MAX_CONNECTIONS,
     decode_responses=True,
 )
 
