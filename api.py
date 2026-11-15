@@ -11,6 +11,7 @@ from models import FlightResponse, FlightSeatMapResponse, OrderResponse, Reserve
 from auth import get_current_user_id
 from rate_limiter import RateLimiter
 from services import (
+    cancel_order_by_user,
     get_flight_seat_map,
     pay_order,
     reserve_seat,
@@ -85,4 +86,15 @@ async def pay_flight_order(
     user_id: Annotated[uuid.UUID, Depends(get_current_user_id)],
 ) -> OrderResponse:
     order = await pay_order(db, order_id, user_id, redis=redis)
+    return OrderResponse.model_validate(order)
+
+
+@router.post("/orders/{order_id}/cancel", response_model=OrderResponse)
+async def cancel_flight_order(
+    order_id: uuid.UUID,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    redis: Annotated[aioredis.Redis, Depends(get_redis)],
+    user_id: Annotated[uuid.UUID, Depends(get_current_user_id)],
+) -> OrderResponse:
+    order = await cancel_order_by_user(db, order_id, user_id, redis=redis)
     return OrderResponse.model_validate(order)

@@ -17,6 +17,7 @@ from services import (
     SeatNotFoundException,
     SeatUnavailableException,
     cancel_expired_order,
+    cancel_order_by_user,
     get_flight_seat_map,
     pay_order,
     process_expired_orders,
@@ -567,3 +568,172 @@ class TestPayAndCancelConcurrency:
                 await db.execute(delete(Flight).where(Flight.id == flight.id))
                 await db.execute(delete(User).where(User.id == user.id))
                 await db.commit()
+
+
+class TestCancelOrderByUser:
+    async def test_cancel_order_success_releases_seat_and_purges_zset(self, db_session, redis_client):
+        user = await _create_test_user(db_session)
+        user2 = await _create_test_user(db_session)
+        flight = await _create_test_flight(db_session)
+        await _create_test_seat(db_session, flight.id, "12A", status=0)
+
+        seat_key = f"flight:{flight.id}:seats"
+        await redis_client.hset(seat_key, "12A", SeatState.LOCKED)
+
+        order = Order(
+            id=uuid.uuid4(),
+            user_id=user.id,
+            flight_id=flight.id,
+            seat_code="12A",
+            status=OrderStatus.PENDING,
+        )
+        db_session.add(order)
+        await db_session.commit()
+
+        await schedule_order_timeout(redis_client, str(order.id), str(flight.id), "12A")
+
+        cancelled = await cancel_order_by_user(db_session, order.id, user.id, redis=redis_client)
+        assert cancelled.status == OrderStatus.CANCELLED
+
+        redis_status = await redis_client.hget(seat_key, "12A")
+        assert redis_status == SeatState.AVAILABLE
+
+        task_payload = json.dumps({
+            "order_id": str(order.id),
+            "flight_id": str(flight.id),
+            "seat_code": "12A",
+        })
+        assert await redis_client.zscore(ORDER_TIMEOUT_QUEUE_KEY, task_payload) is None
+
+        # User 2 can now reserve the released seat immediately
+        order2 = await reserve_seat(db_session, redis_client, user2.id, flight.id, "12A")
+        assert order2.seat_code == "12A"
+        assert order2.status == OrderStatus.PENDING
+
+    async def test_cancel_order_not_found_raises(self, db_session):
+        user = await _create_test_user(db_session)
+        with pytest.raises(OrderNotFoundException):
+            await cancel_order_by_user(db_session, uuid.uuid4(), user.id)
+
+    async def test_cancel_order_forbidden_for_other_user(self, db_session):
+        user1 = await _create_test_user(db_session)
+        user2 = await _create_test_user(db_session)
+        flight = await _create_test_flight(db_session)
+        await _create_test_seat(db_session, flight.id, "12B", status=0)
+
+        order = Order(
+            id=uuid.uuid4(),
+            user_id=user1.id,
+            flight_id=flight.id,
+            seat_code="12B",
+            status=OrderStatus.PENDING,
+        )
+        db_session.add(order)
+        await db_session.commit()
+
+        with pytest.raises(OrderForbiddenException):
+            await cancel_order_by_user(db_session, order.id, user2.id)
+
+    async def test_cancel_order_already_confirmed_raises(self, db_session):
+        user = await _create_test_user(db_session)
+        flight = await _create_test_flight(db_session)
+        await _create_test_seat(db_session, flight.id, "12C", status=1)
+
+        order = Order(
+            id=uuid.uuid4(),
+            user_id=user.id,
+            flight_id=flight.id,
+            seat_code="12C",
+            status=OrderStatus.CONFIRMED,
+        )
+        db_session.add(order)
+        await db_session.commit()
+
+        with pytest.raises(InvalidOrderStatusException):
+            await cancel_order_by_user(db_session, order.id, user.id)
+
+    async def test_cancel_order_already_cancelled_raises(self, db_session):
+        user = await _create_test_user(db_session)
+        flight = await _create_test_flight(db_session)
+        await _create_test_seat(db_session, flight.id, "12D", status=0)
+
+        order = Order(
+            id=uuid.uuid4(),
+            user_id=user.id,
+            flight_id=flight.id,
+            seat_code="12D",
+            status=OrderStatus.CANCELLED,
+        )
+        db_session.add(order)
+        await db_session.commit()
+
+        with pytest.raises(InvalidOrderStatusException):
+            await cancel_order_by_user(db_session, order.id, user.id)
+
+
+class TestCancelOrderAPI:
+    async def test_api_cancel_order_endpoint_success(self, async_client, db_session, redis_client):
+        import jwt
+        from database import settings
+
+        user = await _create_test_user(db_session)
+        flight = await _create_test_flight(db_session)
+        await _create_test_seat(db_session, flight.id, "13A", status=0)
+
+        seat_key = f"flight:{flight.id}:seats"
+        await redis_client.hset(seat_key, "13A", SeatState.LOCKED)
+
+        order = Order(
+            id=uuid.uuid4(),
+            user_id=user.id,
+            flight_id=flight.id,
+            seat_code="13A",
+            status=OrderStatus.PENDING,
+        )
+        db_session.add(order)
+        await db_session.commit()
+
+        token = jwt.encode(
+            {"sub": str(user.id), "type": "access"},
+            settings.JWT_SECRET_KEY,
+            algorithm=settings.JWT_ALGORITHM,
+        )
+        headers = {"Authorization": f"Bearer {token}"}
+
+        resp = await async_client.post(f"/api/v1/orders/{order.id}/cancel", headers=headers)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "Cancelled"
+        assert data["id"] == str(order.id)
+
+        redis_status = await redis_client.hget(seat_key, "13A")
+        assert redis_status == SeatState.AVAILABLE
+
+    async def test_api_cancel_order_forbidden(self, async_client, db_session):
+        import jwt
+        from database import settings
+
+        user1 = await _create_test_user(db_session)
+        user2 = await _create_test_user(db_session)
+        flight = await _create_test_flight(db_session)
+        await _create_test_seat(db_session, flight.id, "13B", status=0)
+
+        order = Order(
+            id=uuid.uuid4(),
+            user_id=user1.id,
+            flight_id=flight.id,
+            seat_code="13B",
+            status=OrderStatus.PENDING,
+        )
+        db_session.add(order)
+        await db_session.commit()
+
+        token2 = jwt.encode(
+            {"sub": str(user2.id), "type": "access"},
+            settings.JWT_SECRET_KEY,
+            algorithm=settings.JWT_ALGORITHM,
+        )
+        headers = {"Authorization": f"Bearer {token2}"}
+
+        resp = await async_client.post(f"/api/v1/orders/{order.id}/cancel", headers=headers)
+        assert resp.status_code == 403

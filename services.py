@@ -469,3 +469,48 @@ async def pay_order(
             )
 
     return order
+
+
+async def cancel_order_by_user(
+    db: AsyncSession,
+    order_id: UUID,
+    user_id: UUID,
+    redis: aioredis.Redis | None = None,
+) -> Order:
+    stmt = select(Order).where(Order.id == order_id)
+    order = (await db.execute(stmt)).scalar_one_or_none()
+    if not order:
+        raise OrderNotFoundException(order_id)
+
+    if order.user_id != user_id:
+        raise OrderForbiddenException("You do not have permission to cancel this order.")
+
+    stmt = (
+        update(Order)
+        .where(Order.id == order_id, Order.status == OrderStatus.PENDING)
+        .values(status=OrderStatus.CANCELLED)
+    )
+    result = await db.execute(stmt)
+    if result.rowcount == 0:
+        raise InvalidOrderStatusException("Order already processed or expired.")
+
+    await db.commit()
+    await db.refresh(order)
+    logger.info("Order %s cancelled by user %s", order_id, user_id)
+
+    if redis is not None:
+        order_task = json.dumps({
+            "order_id": str(order.id),
+            "flight_id": str(order.flight_id),
+            "seat_code": order.seat_code,
+        })
+        try:
+            await redis.zrem(ORDER_TIMEOUT_QUEUE_KEY, order_task)
+            seat_key = f"flight:{order.flight_id}:seats"
+            await redis.hset(seat_key, order.seat_code, SeatState.AVAILABLE)
+        except Exception:
+            logger.warning(
+                "Failed to release seat or purge queue for order %s", order.id, exc_info=True
+            )
+
+    return order
