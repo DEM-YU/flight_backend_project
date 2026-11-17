@@ -1,6 +1,14 @@
 # Flight Booking Backend
 
-A flight search and seat reservation backend built with **FastAPI**, **PostgreSQL**, and **Redis**. Focuses on atomic seat reservations to prevent overselling under concurrent load, cache-aside querying, and JWT authentication with Redis-backed session revocation.
+[![CI](https://github.com/DEM-YU/flight_backend_project/actions/workflows/ci.yml/badge.svg)](https://github.com/DEM-YU/flight_backend_project/actions/workflows/ci.yml)
+
+A flight seat reservation backend built with FastAPI, PostgreSQL, and Redis. It models concurrent seat locking, cache-aside queries, and asynchronous order expiration.
+
+---
+
+## Scope
+
+This project models the seat reservation and locking step of flight booking, where each seat is a mutually exclusive resource. Real-world airline reservation systems typically decrement inventory counts per fare bucket (such as Economy Class Y) during initial booking and assign physical seat numbers later during check-in. This project uses discrete seat locking as a simplified model to practice concurrency control and state consistency, and is not a complete ticketing system.
 
 ---
 
@@ -8,20 +16,80 @@ A flight search and seat reservation backend built with **FastAPI**, **PostgreSQ
 
 | Technology | Role |
 | :--- | :--- |
-| **FastAPI** | Asynchronous web framework (Python 3.12) |
-| **PostgreSQL** | Relational database for storing users, flight metadata, and orders |
-| **Redis** | In-memory store for atomic seat locks and route cache |
-| **SQLAlchemy (Async)** | Async ORM for database operations |
-| **PyJWT & Bcrypt** | Password hashing and JWT generation |
+| **FastAPI** (0.111.0) | Asynchronous web framework |
+| **PostgreSQL 15** & **asyncpg** | Relational database with async driver |
+| **SQLAlchemy 2.0** (Async) | Object-relational mapping and schema definitions |
+| **Redis 7** & **redis-py** | In-memory store for Lua scripts, caching, and delay queues |
+| **PyJWT** & **Bcrypt** | Token authentication and password hashing |
+| **pytest** & **pytest-asyncio** | Test suite running against live container instances |
 | **Docker Compose** | Local container setup for PostgreSQL and Redis |
 
 ---
 
-## System Architecture & Workflows
+## Quick Start
 
-### 1. Atomic Seat Reservation (Lua Lock + PG Transaction)
+### Prerequisites
+* Docker and Docker Compose
+* Python 3.12+
 
-To prevent overselling under concurrent requests, seat availability checks and locking are decoupled from the database and handled in Redis using a **Lua script**. If the database transaction fails to commit (e.g. connection drops or constraint violations), the backend issues a **compensating write** in Redis to release the seat.
+### 1. Start Database and Redis Containers
+```bash
+docker compose up -d
+```
+
+### 2. Configure Environment Variables
+```bash
+cp .env.example .env
+```
+
+### 3. Install Dependencies
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
+
+### 4. Seed Test Data
+Populate the database with a flight, 100 seats, and 1,000 user accounts:
+```bash
+python seed.py
+```
+
+### 5. Start the API Server
+```bash
+uvicorn main:app --port 8000
+# Add --reload during local development if hot-reloading is desired
+```
+* Interactive API documentation is available at `http://localhost:8000/docs`.
+
+### 6. Run Integration Tests
+```bash
+pytest -v
+```
+
+---
+
+## API Overview
+
+| Method | Path | Auth Required | Description |
+| :--- | :--- | :--- | :--- |
+| **POST** | `/api/v1/auth/register` | None | Register a new user with email and password |
+| **POST** | `/api/v1/auth/login` | None | Authenticate user and return access and refresh tokens |
+| **POST** | `/api/v1/auth/refresh` | Refresh Token | Reissue an access token using a valid refresh token |
+| **POST** | `/api/v1/auth/logout` | Refresh Token | Invalidate the refresh token in Redis |
+| **GET** | `/health` | None | Health check returning database and Redis connection statuses |
+| **GET** | `/api/v1/flights` | None | Search flights by departure, arrival, and travel date |
+| **GET** | `/api/v1/flights/{flight_id}/seats` | None | Retrieve flight seat map with real-time availability |
+| **POST** | `/api/v1/orders/reserve` | JWT Access Token | Atomically reserve a seat and schedule a 60-second expiration |
+| **POST** | `/api/v1/orders/{order_id}/pay` | JWT Access Token | Confirm payment for a pending order and mark seat occupied in database |
+| **POST** | `/api/v1/orders/{order_id}/cancel` | JWT Access Token | Cancel a pending order, release Redis seat, and remove from timeout queue |
+
+---
+
+## Design Notes
+
+### 1. Seat Locking
+Seat availability checks and locking run in Redis via a Lua script that checks whether the seat state is available (`0`) and updates it to locked (`1`) in a single round-trip. This avoids database row lock contention during concurrent reservation requests and rejects conflicting attempts early before reaching PostgreSQL. If the subsequent database insert fails due to network or application errors, a compensating write is sent to Redis to unlock the seat. As an additional safeguard, the orders table enforces a partial unique index on `(flight_id, seat_code)` for active statuses (`Pending`, `Confirmed`) to reject duplicate active bookings if Redis state ever desyncs.
 
 ```mermaid
 sequenceDiagram
@@ -32,7 +100,6 @@ sequenceDiagram
     participant DB as PostgreSQL
 
     Client->>API: POST /api/v1/orders/reserve {flight_id, seat_code} (JWT Authorized)
-    Note over API: Extract user_id from JWT
     API->>Redis: EVAL RESERVE_SEAT_SCRIPT (Lua check-and-set)
     alt Seat Not Found (-1)
         Redis-->>API: Return -1
@@ -41,202 +108,70 @@ sequenceDiagram
         Redis-->>API: Return 0
         API-->>Client: HTTP 409 (Seat Unavailable)
     else Seat Locked Successfully (1)
-        Redis-->>API: Return 1 (Seat marked '1' in Hash)
-        
-        Note over API: Start PostgreSQL Transaction
-        API->>DB: INSERT INTO orders (id, user_id, flight_id, seat_code, status='Pending')
-        
+        Redis-->>API: Return 1
+        API->>DB: INSERT INTO orders (status='Pending')
         alt PG Commit Success
-            DB-->>API: Transaction Committed
+            DB-->>API: Committed
             API->>Redis: ZADD order:timeout:zset (Schedule 60s Expiration)
-            API-->>Client: HTTP 201 Created (Order Response)
-        else PG Commit Failure (Database down / exception)
-            DB-->>API: DB Exception & Rollback
-            Note over API: Compensating Rollback Active
-            API->>Redis: HSET flight:{id}:seats {seat_code} '0' (Unlock Seat)
-            API-->>Client: HTTP 500 Internal Server Error
+            API-->>Client: HTTP 201 Created
+        else PG Commit Failure (Exception / Duplicate)
+            DB-->>API: Rollback
+            API->>Redis: HSET flight:{id}:seats {seat_code} '0' (Compensating Release)
+            API-->>Client: HTTP 409 or 500
         end
     end
 ```
 
-### 2. Redis ZSet Delay Queue for Order Expiration
+### 2. Payment and Cancellation Race Condition Handling
+Order payment and timeout cancellation both execute an atomic conditional update (`UPDATE orders SET status = ... WHERE id = :id AND status = 'Pending'`) and check the affected rowcount. This prevents race conditions where an order is paid and cancelled simultaneously, guaranteeing that only the first operation succeeds. In the timeout cancellation worker, the Redis seat lock is only released if the database update affected exactly one row, preventing a paid seat from being mistakenly reopened. When a payment succeeds, the order payload is explicitly removed from the timeout delay queue using `ZREM` so the background worker does not poll it later.
 
-Unpaid orders expire after **60 seconds**. Rather than relying on in-process sleep tasks that are lost upon server restarts, expiration timestamps are stored in a **Redis Sorted Set (ZSet)** delay queue (`score = unix_timestamp + 60s`). A background worker periodically pops due orders via a Lua script (`ZRANGEBYSCORE` + `ZREM`), cancels unpaid orders in PostgreSQL, and releases the Redis seat lock with linear backoff retries.
+### 3. Timeout Delay Queue
+Unpaid orders are scheduled for cancellation by adding their ID, flight ID, and seat code to a Redis Sorted Set (`order:timeout:zset`) with a Unix timestamp score 60 seconds in the future. A background worker periodically polls the queue using a Lua script that executes `ZRANGEBYSCORE` and `ZREM` atomically to retrieve and claim due tasks without duplicate execution across workers. If releasing a seat in Redis fails after database cancellation, the worker retries up to three times with backoff before logging an error for manual review. This setup avoids maintaining in-memory sleep timers that would be lost on server restart. Because the polling loop runs on a fixed one-second interval, order cancellation has a time resolution of up to one second.
 
 ```mermaid
 graph TD
-    A[Order Created: Status = Pending] --> B["Register in Redis ZSet delay queue (score = now + 60s)"]
-    B --> C["Background Worker polls ZSet atomically via Lua script"]
-    C -->|Order Due & Popped| D[Fetch Order Status via isolated DB Session]
-    D -->|Status is CONFIRMED/CANCELLED| E[No Action Needed - Discard]
-    D -->|Status is still PENDING| F[Update Order Status to CANCELLED in DB]
-    F --> G["Release Redis Lock: set seat to '0'"]
-    G -->|Success| H[Lock Released Successfully]
-    G -->|Failure due to network/Redis blip| I[Linear Backoff Retry]
-    I -->|Attempt 1-3 Success| H
-    I -->|All Retries Exhausted| J[CRITICAL Alarm: Log Ghost Lock for Manual Audit]
+    A[Order Created: Status = Pending] --> B["Add to Redis ZSet with score = now + 60s"]
+    B --> C["Background worker polls ZSet atomically via Lua"]
+    C -->|Due Task Popped| D["Execute conditional update: UPDATE orders SET status='Cancelled' WHERE id=:id AND status='Pending'"]
+    D -->|rowcount == 0: already paid or cancelled| E[Discard - Skip seat release]
+    D -->|rowcount == 1: cancelled successfully| F["Release Redis seat lock: HSET status=0"]
+    F -->|Success| G[Seat released to available]
+    F -->|Failure| H[Retry with backoff up to 3 times]
 ```
+
+### 4. Query Caching
+Flight search queries use a Cache-Aside pattern where route query results are serialized to JSON and stored in Redis with a 30-minute base TTL plus up to 5 minutes of random jitter. Adding jitter prevents large sets of cached flights from expiring at the same moment, avoiding cache avalanche. Empty query results are cached with a short 60-second TTL to avoid repeated database lookups for non-existent routes while still reflecting newly created flights within a minute. Flight seat maps are stored in Redis hashes and loaded from PostgreSQL into Redis on demand when keys are missing. However, seat map lookups do not use mutexes, meaning an uncached flight receiving a traffic spike will send concurrent queries to PostgreSQL until the cache is populated.
+
+### 5. Authentication and Rate Limiting
+User authentication uses JWT access tokens with a 15-minute expiration and refresh tokens stored in Redis with a 7-day TTL. Logging out deletes the refresh token from Redis, preventing it from generating new access tokens even if the token itself has not reached its cryptographic expiration. The reservation endpoint is protected by a sliding window rate limiter implemented with a Redis Sorted Set, tracking request timestamps per client. The limiter identifies clients by user ID extracted from the JWT token for authenticated requests, and falls back to `request.client.host` for unauthenticated calls. Because it relies on `request.client.host` directly, deploying the service behind a reverse proxy requires configuring proxy headers to extract the real client IP.
 
 ---
 
-## Design Decisions & Concurrency Handling
+## Testing
 
-### 1. Atomic Locking via Redis Lua Script
-* **Context:** In a high-concurrency booking scenario, database transactions (`SELECT ... FOR UPDATE`) lead to lock contention and connection pool exhaustion. Using separate Redis `GET` and `SET` calls introduces race conditions.
-* **Approach:** Check-and-set logic runs in a single Redis Lua script:
-  ```lua
-  local status = redis.call('HGET', KEYS[1], ARGV[1])
-  if status == false then return -1 end       -- Seat does not exist
-  if status == '0' then 
-      redis.call('HSET', KEYS[1], ARGV[1], '1') -- Lock the seat atomically
-      return 1 
-  else 
-      return 0                                -- Already locked
-  end
-  ```
-  This avoids race conditions and moves lock contention out of PostgreSQL.
+The test suite contains 46 tests: 40 integration tests execute against live PostgreSQL 15 and Redis 7 container instances, and 6 unit tests cover password hashing, JWT encoding/decoding, and client identifier parsing. Database test isolation is maintained by running each test inside an outer transaction with savepoints that roll back on completion, while Redis tests use database 15 and flush keys between runs. The GitHub Actions CI pipeline spins up the same PostgreSQL and Redis service containers and executes all tests automatically on push and pull requests.
 
-### 2. Dual-Write Rollback (Preventing Ghost Locks)
-* **Problem:** If a seat is locked in Redis but the subsequent PostgreSQL write fails, the seat remains locked in Redis with no matching order in the database ("ghost lock").
-* **Solution:** The database insert is wrapped in a `try...except` block. If the database commit fails, the transaction is rolled back and a compensating `HSET` resets the seat back to available (`0`) in Redis.
+### Concurrency Benchmark Results
 
-### 3. Flight Search Caching (Cache-Aside)
-* **Cache-Aside:** Flight search queries check Redis first and fall back to PostgreSQL on a cache miss.
-* **Cache Stampede Prevention:** To prevent simultaneous cache expiration across popular routes, a random jitter of ±300s (5 minutes) is added to the 30-minute base TTL.
-* **Negative Caching:** Routes with no scheduled flights are cached with a short 60-second TTL to avoid repeated database lookups for empty search results.
+The following numbers were measured locally against a single Uvicorn worker process running without `--reload` on macOS (Apple M4):
 
-### 4. JWT Authentication with Refresh Token Revocation
-* **Token Pair:** Login issues a short-lived Access Token (15 minutes) and a long-lived Refresh Token (7 days).
-* **Revocation via Redis:** Refresh tokens are stored in Redis (`refresh_token:<token>`). Calling `/auth/logout` deletes the key from Redis. During token refresh, the endpoint validates both the JWT signature and its existence in Redis, allowing active revocation before token expiry.
+| Mode | Requests | 201 | 409 | 503 | Timeout | P50 (ms) | P99 (ms) |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **regular** (50 users, 1 seat) | 50 | 1 | 49 | 0 | 0 | 16.6 | 20.9 |
+| **extreme** (1,000 users, 1 seat) | 1,000 | 1 | 999 | 0 | 0 | 367.5 | 402.5 |
+| **flash-sale** (1,000 users, 50 seats) | 1,000 | 50 | 950 | 0 | 0 | 771.7 | 891.6 |
+| **pool-exhaust** (60 users, 60 seats) | 60 | 60 | 0 | 0 | 0 | 257.2 | 361.3 |
+| **breakdown** (3,000 users, 1 seat) | 3,000 | 0 | 686 | 1,000 | 1,314 | 1,489.6 | 1,501.2 |
 
-### 5. Sliding-Window Rate Limiting
-* Protects `/orders/reserve` against rapid-fire requests using a Redis ZSet sliding-window script.
-* Identifies clients by JWT user ID or client IP, returning HTTP 429 with `Retry-After` headers when limits are exceeded.
+Each mode was run once on a local development machine; numbers vary between runs due to background system load and event loop scheduling. In single-seat contention tests (`regular` and `extreme`), exactly 1 request succeeded and the remaining requests were rejected at the Redis layer. In the multi-seat test (`flash-sale`), all 50 available seats were reserved and written to PostgreSQL with 0 duplicate orders. Under 3,000 concurrent requests with a 1.5-second client timeout (`breakdown`), event loop queue delays and connection pool limits caused 1,314 timeouts and 1,000 503 errors, showing the throughput boundary of a single worker process.
 
 ---
 
-## Project Structure
+## Known Limitations
 
-```
-flight_backend_project/
-├── main.py          # FastAPI application, exception handlers, and lifespan
-├── api.py           # Flight search and seat reservation endpoints
-├── auth_api.py      # Registration, login, logout, and token refresh endpoints
-├── services.py      # Reservation logic, Redis Lua scripts, and timeout worker
-├── rate_limiter.py  # Sliding-window rate limiting dependency via Redis ZSet
-├── models.py        # SQLAlchemy models and Pydantic schemas
-├── auth.py          # Password hashing (bcrypt) and JWT utilities
-├── database.py      # Database engines, session makers, and settings
-├── seed.py          # Database seeder initializing flights and seats for testing
-├── stress_test.py   # Concurrency test script for overselling verification
-└── tests/
-    ├── test_auth.py         # Authentication and token lifecycle tests
-    ├── test_services.py     # Unit tests for reservation, locking, and timeout
-    └── test_rate_limiter.py # Unit and integration tests for rate limiting
-```
-
----
-
-## Core API Endpoints
-
-| Method | Endpoint | Description | Auth Required |
-| :--- | :--- | :--- | :--- |
-| **POST** | `/api/v1/auth/register` | Register a new user account | None |
-| **POST** | `/api/v1/auth/login` | Authenticate and return Access + Refresh Token | None |
-| **POST** | `/api/v1/auth/logout` | Revoke user session and delete Refresh Token from Redis | **Refresh Token** |
-| **POST** | `/api/v1/auth/refresh` | Reissue Access Token using a valid Refresh Token | None |
-| **GET** | `/health` | Health check endpoint returning database and Redis connectivity | None |
-| **GET** | `/api/v1/flights` | Search flights (Cache-Aside, returns `X-Cache-Status` header) | None |
-| **POST** | `/api/v1/orders/reserve` | Reserve seat atomically (Returns order details, schedules timeout) | **JWT Access Token** |
-| **POST** | `/api/v1/orders/{order_id}/pay` | Confirm payment for order, update status to Confirmed, and mark seat occupied in DB | **JWT Access Token** |
-
----
-
-## Local Setup
-
-### Prerequisites
-* Docker & Docker Compose
-* Python 3.12+
-
-### 1. Start PostgreSQL & Redis
-```bash
-docker compose up -d
-```
-
-### 2. Configure Environment Variables
-```bash
-cp .env.example .env
-```
-
-### 3. Install Python Dependencies
-```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-```
-
-### 4. Seed Data & Start the Server
-Seed a test flight with 30 seats and start the development server:
-```bash
-python seed.py
-uvicorn main:app --host 0.0.0.0 --port 8000 --reload
-```
-* Interactive API Docs: `http://localhost:8000/docs`
-
-### 5. Run Tests
-```bash
-pytest -v
-```
-
----
-
-## Concurrency Testing
-
-A concurrency script verifies that concurrent requests for the same seat result in exactly one successful reservation:
-
-```bash
-python stress_test.py
-```
-
-**Test Flow:**
-1. Logs in with the test user (`test@example.com`) to retrieve a JWT Access Token.
-2. Fires **30 concurrent async requests** for the same seat (`1A`) on flight `00000000-0000-0000-0000-000000000001`.
-3. Verifies that exactly 1 request succeeds (HTTP 201), while the remaining requests receive conflict (HTTP 409) or rate limited (HTTP 429).
-
-**Sample Output:**
-```text
-============================================================
-  Flight Seat Reservation — Stress Test
-============================================================
-  Server:      http://127.0.0.1:8000
-  Flight ID:   00000000-0000-0000-0000-000000000001
-  Seat Code:   1A
-  Concurrency: 30
-  Reset Seat:  No
-============================================================
-
-[1/4] Checking server availability ...
-  Server is online.
-
-[2/4] Skipping seat reset (use --reset to enable).
-
-[3/4] Logging in as test user ...
-  Login OK. Token acquired.
-
-[4/4] Firing 30 concurrent reserve requests ...
-------------------------------------------------------------
-  [OK]  [01] reserved, order_id=...
-  [409] [02] conflict: Seat is already reserved or unavailable.
-  ...
-  [429] [11] rate limited: Too many requests. Please try again later.
-  ...
-============================================================
-  Success:      1
-  Conflict:     9
-  Rate Limited: 20
-  Error:        0
-  Exception:    0
-============================================================
-  RESULT: PASS — exactly 1 reservation succeeded.
-============================================================
-```
+1. **Crash Between Redis Lock and Database Write**: If the server process is killed abruptly (e.g. SIGKILL or power outage) after Redis locks a seat but before PostgreSQL commits the order, the seat remains locked in Redis with no corresponding order in PostgreSQL. The application-level `try/except` compensation rollback only handles catchable exceptions, so an external reconciliation job is required to resolve ghost locks after hard crashes.
+2. **In-Process Background Worker**: The timeout cancellation worker runs as an `asyncio` task within the same process as the web server. While atomic Lua dequeue makes multi-instance polling safe from duplicate processing, the worker cannot be scaled or monitored independently from the API server.
+3. **Database Schema Setup**: Tables are created using `Base.metadata.create_all` and a raw SQL statement for the partial unique index during application startup. The project does not currently use database migration tools such as Alembic.
+4. **No Protection Against Concurrent Cache Rebuilds on Seat Maps**: Seat map lookups query PostgreSQL directly on cache misses without a mutex or singleflight mechanism. A traffic spike on an uncached flight will send concurrent database queries until the Redis key is populated.
+5. **Reverse Proxy Client Identification**: Anonymous rate limiting uses `request.client.host` directly. When deployed behind a reverse proxy or load balancer, middleware is required to read `X-Forwarded-For` to avoid grouping all users under the proxy IP.
+6. **Single-Worker Concurrency Limit**: Under 3,000 instant concurrent requests, the single-core Uvicorn event loop and Redis connection pool limits saturated, resulting in 503 errors and client timeouts. Scaling beyond this requires multi-worker deployment (e.g. Gunicorn with Uvicorn workers) and an upstream reverse proxy.
