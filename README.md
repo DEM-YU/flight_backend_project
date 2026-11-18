@@ -89,7 +89,7 @@ pytest -v
 ## Design Notes
 
 ### 1. Seat Locking
-Seat availability checks and locking run in Redis via a Lua script that checks whether the seat state is available (`0`) and updates it to locked (`1`) in a single round-trip. This avoids database row lock contention during concurrent reservation requests and rejects conflicting attempts early before reaching PostgreSQL. If the subsequent database insert fails due to network or application errors, a compensating write is sent to Redis to unlock the seat. As an additional safeguard, the orders table enforces a partial unique index on `(flight_id, seat_code)` for active statuses (`Pending`, `Confirmed`) to reject duplicate active bookings if Redis state ever desyncs.
+Seat availability checks and locking run in Redis via a Lua script that checks whether the seat state is available (`0`) and updates it to locked (`1`) in a single round-trip. This avoids database row lock contention during concurrent reservation requests and rejects conflicting attempts early before reaching PostgreSQL. If the subsequent database insert fails due to network or application errors, a compensating write is sent to Redis to unlock the seat. Similarly, if scheduling the expiration task in the Redis delay queue fails after database insertion, a compensating transaction cancels the database order and unlocks the Redis seat to prevent orphaned pending orders. As an additional safeguard, the orders table enforces a partial unique index on `(flight_id, seat_code)` for active statuses (`Pending`, `Confirmed`) to reject duplicate active bookings if Redis state ever desyncs.
 
 ```mermaid
 sequenceDiagram
@@ -113,7 +113,14 @@ sequenceDiagram
         alt PG Commit Success
             DB-->>API: Committed
             API->>Redis: ZADD order:timeout:zset (Schedule 60s Expiration)
-            API-->>Client: HTTP 201 Created
+            alt ZADD Success
+                Redis-->>API: Enqueued
+                API-->>Client: HTTP 201 Created
+            else ZADD Failure
+                API->>DB: UPDATE orders SET status='Cancelled' (Compensating Cancel)
+                API->>Redis: HSET flight:{id}:seats {seat_code} '0' (Compensating Release)
+                API-->>Client: HTTP 500 (Internal Server Error)
+            end
         else PG Commit Failure (Exception / Duplicate)
             DB-->>API: Rollback
             API->>Redis: HSET flight:{id}:seats {seat_code} '0' (Compensating Release)
@@ -123,10 +130,10 @@ sequenceDiagram
 ```
 
 ### 2. Payment and Cancellation Race Condition Handling
-Order payment and timeout cancellation both execute an atomic conditional update (`UPDATE orders SET status = ... WHERE id = :id AND status = 'Pending'`) and check the affected rowcount. This prevents race conditions where an order is paid and cancelled simultaneously, guaranteeing that only the first operation succeeds. In the timeout cancellation worker, the Redis seat lock is only released if the database update affected exactly one row, preventing a paid seat from being mistakenly reopened. When a payment succeeds, the seat is confirmed locked in Redis, and the order payload is explicitly removed from the timeout delay queue using `ZREM` so the background worker does not poll it later.
+Order payment and timeout cancellation both execute an atomic conditional update (`UPDATE orders SET status = ... WHERE id = :id AND status = 'Pending'`) and check the affected rowcount. This prevents race conditions where an order is paid and cancelled simultaneously, guaranteeing that only the first operation succeeds. In the timeout cancellation worker, the Redis seat lock is only released if the database update affected exactly one row, preventing a paid seat from being mistakenly reopened. User-initiated cancellation similarly performs a conditional database update, purges the task from the timeout queue, and releases the Redis seat lock with three backoff retries via `release_seat_with_retry`. When a payment succeeds, the seat is confirmed locked in Redis, and the order payload is explicitly removed from the timeout delay queue using `ZREM` so the background worker does not poll it later.
 
 ### 3. Timeout Delay Queue
-Unpaid orders are scheduled for cancellation by adding their ID, flight ID, and seat code to a Redis Sorted Set (`order:timeout:zset`) with a Unix timestamp score 60 seconds in the future. A background worker periodically polls the queue using a Lua script that executes `ZRANGEBYSCORE` and `ZREM` atomically to retrieve and claim due tasks without duplicate execution across workers. If executing the database cancellation fails due to transient connection errors, the worker re-queues the popped task into the ZSet with a 5-second delay (up to three attempts) to avoid message loss upon pop. If releasing a seat in Redis fails after database cancellation, the worker retries up to three times with backoff before logging an error for manual review. This setup avoids maintaining in-memory sleep timers that would be lost on server restart. Because the polling loop runs on a fixed one-second interval, order cancellation has a time resolution of up to one second.
+Unpaid orders are scheduled for cancellation by adding their ID, flight ID, and seat code to a Redis Sorted Set (`order:timeout:zset`) with a Unix timestamp score 60 seconds in the future. A background worker periodically polls the queue using a Lua script that executes `ZRANGEBYSCORE` and `ZREM` atomically to retrieve and claim due tasks without duplicate execution across workers. If executing the database cancellation fails due to transient connection errors, the worker re-queues the popped task into the ZSet with a 5-second delay (up to three attempts) to avoid message loss upon pop. If releasing a seat in Redis fails after database cancellation (in either the background timeout worker or user-initiated cancellation), the system retries up to three times with exponential backoff (`release_seat_with_retry`) before logging an error for manual review. This setup avoids maintaining in-memory sleep timers that would be lost on server restart. Because the polling loop runs on a fixed one-second interval, order cancellation has a time resolution of up to one second.
 
 ```mermaid
 graph TD
@@ -151,7 +158,7 @@ User authentication uses JWT access tokens with a 15-minute expiration and refre
 
 ## Testing
 
-The test suite contains 52 tests: 46 integration tests execute against live PostgreSQL 15 and Redis 7 container instances, and 6 unit tests cover password hashing, JWT encoding/decoding, and client identifier parsing. Database test isolation is maintained by running each test inside an outer transaction with savepoints that roll back on completion, while Redis tests use database 15 and flush keys between runs. The GitHub Actions CI pipeline spins up the same PostgreSQL and Redis service containers and executes all tests automatically on push and pull requests.
+The test suite contains 53 tests: 47 integration tests execute against live PostgreSQL 15 and Redis 7 container instances, and 6 unit tests cover password hashing, JWT encoding/decoding, and client identifier parsing. Database test isolation is maintained by running each test inside an outer transaction with savepoints that roll back on completion, while Redis tests use database 15 and flush keys between runs. The GitHub Actions CI pipeline spins up the same PostgreSQL and Redis service containers and executes all tests automatically on push and pull requests.
 
 ### Concurrency Benchmark Results
 
@@ -171,7 +178,7 @@ Each mode was run once on a local development machine; numbers vary between runs
 
 ## Known Limitations
 
-1. **Crash Between Redis Lock and Database Write**: If the server process is killed abruptly (e.g. SIGKILL or power outage) after Redis locks a seat but before PostgreSQL commits the order, the seat remains locked in Redis with no corresponding order in PostgreSQL. The application-level `try/except` compensation rollback only handles catchable exceptions, so an external reconciliation job is required to resolve ghost locks after hard crashes.
+1. **Crash Boundaries in Distributed Saga Steps**: If the server process is killed abruptly (e.g. SIGKILL or power outage) after Redis locks a seat but before PostgreSQL commits the order, the seat remains locked in Redis with no corresponding order in PostgreSQL. Similarly, if the process is killed after the database commit succeeds but before the expiration task is enqueued to Redis ZSet, the order remains stuck in `Pending` indefinitely without an automated timeout task. Because application-level compensation rollback only catches runtime exceptions within a live process, an external reconciliation job or periodic background sweep is required to resolve ghost locks and stranded pending orders after hard crashes.
 2. **In-Process Background Worker**: The timeout cancellation worker runs as an `asyncio` task within the same process as the web server. While atomic Lua dequeue makes multi-instance polling safe from duplicate processing, the worker cannot be scaled or monitored independently from the API server.
 3. **Database Schema Setup**: Tables are created using `Base.metadata.create_all` and a raw SQL statement for the partial unique index during application startup. The project does not currently use database migration tools such as Alembic.
 4. **No Protection Against Concurrent Cache Rebuilds on Seat Maps**: Seat map lookups query PostgreSQL directly on cache misses without a mutex or singleflight mechanism. A traffic spike on an uncached flight will send concurrent database queries until the Redis key is populated.

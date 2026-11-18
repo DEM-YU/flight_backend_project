@@ -356,6 +356,40 @@ class TestReserveSeat:
         seat_status = await redis_client.hget(seat_key, "5A")
         assert seat_status == SeatState.LOCKED
 
+    async def test_reserve_seat_compensates_if_timeout_scheduling_fails(
+        self, db_session, redis_client, caplog
+    ):
+        """Verify Saga compensation: If scheduling Redis ZSet timeout fails after DB commit,
+        the order must be cancelled in PostgreSQL and the Redis seat lock released."""
+        user = await _create_test_user(db_session)
+        flight = await _create_test_flight(db_session)
+        await _create_test_seat(db_session, flight.id, "7A")
+
+        seat_key = f"flight:{flight.id}:seats"
+        await redis_client.hset(seat_key, "7A", SeatState.AVAILABLE)
+
+        with patch("services.schedule_order_timeout", new_callable=AsyncMock) as mock_sched:
+            mock_sched.side_effect = RuntimeError("Redis ZSet timeout queue connection failed")
+
+            with pytest.raises(RuntimeError) as exc_info:
+                await reserve_seat(db_session, redis_client, user.id, flight.id, "7A")
+
+            assert "Reservation cancelled" in str(exc_info.value)
+
+        # 1. Redis seat lock MUST be released back to AVAILABLE ('0')
+        seat_status = await redis_client.hget(seat_key, "7A")
+        assert seat_status == SeatState.AVAILABLE
+
+        # 2. Database order must NOT be left in PENDING status; it must be CANCELLED
+        stmt = select(Order).where(Order.flight_id == flight.id, Order.seat_code == "7A")
+        order_in_db = (await db_session.execute(stmt)).scalar_one_or_none()
+        assert order_in_db is not None
+        assert order_in_db.status == OrderStatus.CANCELLED
+
+        # 3. Verify logging accuracy: timeout queue failure was logged, NOT a misleading DB commit failure
+        assert "Failed to schedule timeout queue" in caplog.text
+        assert "DB commit failed" not in caplog.text
+
 
 class TestRedisZSetTimeoutQueue:
     async def test_schedule_and_process_expired_orders(self, redis_client):

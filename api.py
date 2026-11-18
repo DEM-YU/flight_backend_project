@@ -15,7 +15,6 @@ from services import (
     get_flight_seat_map,
     pay_order,
     reserve_seat,
-    schedule_order_timeout,
     search_flights,
 )
 
@@ -68,12 +67,6 @@ async def reserve_flight_seat(
 ) -> OrderResponse:
     order = await reserve_seat(
         db, redis, user_id, req.flight_id, req.seat_code
-    )
-    await schedule_order_timeout(
-        redis,
-        str(order.id),
-        str(req.flight_id),
-        req.seat_code,
     )
     return OrderResponse.model_validate(order)
 

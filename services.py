@@ -250,12 +250,30 @@ async def get_flight_seat_map(
     )
 
 
+async def schedule_order_timeout(
+    redis: aioredis.Redis,
+    order_id: str,
+    flight_id: str,
+    seat_code: str,
+    delay: int = _ORDER_TIMEOUT_SECONDS,
+) -> None:
+    expire_at = datetime.now(timezone.utc).timestamp() + delay
+    order_task = json.dumps({
+        "order_id": order_id,
+        "flight_id": flight_id,
+        "seat_code": seat_code,
+    })
+    await redis.zadd(ORDER_TIMEOUT_QUEUE_KEY, {order_task: expire_at})
+    logger.info("Order %s scheduled for timeout in %ds via Redis ZSet", order_id, delay)
+
+
 async def reserve_seat(
     db: AsyncSession,
     redis: aioredis.Redis,
     user_id: UUID,
     flight_id: UUID,
     seat_code: str,
+    timeout_delay: int = _ORDER_TIMEOUT_SECONDS,
 ) -> Order:
     seat_key = f"flight:{flight_id}:seats"
 
@@ -278,7 +296,7 @@ async def reserve_seat(
             f"Seat {seat_code} on flight {flight_id} is unavailable."
         )
 
-    # Roll back Redis lock if DB write fails to avoid ghost locks
+    # 1. Persist Pending order to PostgreSQL
     try:
         order = Order(
             id=uuid.uuid4(),
@@ -290,11 +308,6 @@ async def reserve_seat(
         db.add(order)
         await db.commit()
         await db.refresh(order)
-        logger.info(
-            "Seat %s locked on flight %s for user %s, order %s",
-            seat_code, flight_id, user_id, order.id,
-        )
-        return order
     except IntegrityError as exc:
         await db.rollback()
         err_msg = str(exc).lower()
@@ -325,22 +338,43 @@ async def reserve_seat(
         await redis.hset(seat_key, seat_code, SeatState.AVAILABLE)
         raise
 
+    # 2. Schedule expiration in Redis ZSet delay queue.
+    # If queue scheduling fails, execute compensating cancellation to prevent ghost Pending orders.
+    # This block is separated from DB creation so failures here do not trigger DB rollback or redundant Redis unlock.
+    try:
+        await schedule_order_timeout(
+            redis, str(order.id), str(flight_id), seat_code, delay=timeout_delay
+        )
+    except Exception as queue_exc:
+        logger.error(
+            "Failed to schedule timeout queue for order %s on flight %s, executing compensating rollback",
+            order.id, flight_id, exc_info=True,
+        )
+        try:
+            stmt = (
+                update(Order)
+                .where(Order.id == order.id, Order.status == OrderStatus.PENDING)
+                .values(status=OrderStatus.CANCELLED)
+            )
+            await db.execute(stmt)
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            logger.error(
+                "Failed to cancel DB order %s during timeout queue compensation",
+                order.id,
+                exc_info=True,
+            )
+        await release_seat_with_retry(redis, flight_id, seat_code, order.id)
+        raise RuntimeError(
+            f"Failed to schedule expiration for order {order.id}. Reservation cancelled."
+        ) from queue_exc
 
-async def schedule_order_timeout(
-    redis: aioredis.Redis,
-    order_id: str,
-    flight_id: str,
-    seat_code: str,
-    delay: int = _ORDER_TIMEOUT_SECONDS,
-) -> None:
-    expire_at = datetime.now(timezone.utc).timestamp() + delay
-    order_task = json.dumps({
-        "order_id": order_id,
-        "flight_id": flight_id,
-        "seat_code": seat_code,
-    })
-    await redis.zadd(ORDER_TIMEOUT_QUEUE_KEY, {order_task: expire_at})
-    logger.info("Order %s scheduled for timeout in %ds via Redis ZSet", order_id, delay)
+    logger.info(
+        "Seat %s locked on flight %s for user %s, order %s scheduled for timeout in %ds",
+        seat_code, flight_id, user_id, order.id, timeout_delay,
+    )
+    return order
 
 
 async def cancel_expired_order(
