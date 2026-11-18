@@ -126,13 +126,15 @@ sequenceDiagram
 Order payment and timeout cancellation both execute an atomic conditional update (`UPDATE orders SET status = ... WHERE id = :id AND status = 'Pending'`) and check the affected rowcount. This prevents race conditions where an order is paid and cancelled simultaneously, guaranteeing that only the first operation succeeds. In the timeout cancellation worker, the Redis seat lock is only released if the database update affected exactly one row, preventing a paid seat from being mistakenly reopened. When a payment succeeds, the order payload is explicitly removed from the timeout delay queue using `ZREM` so the background worker does not poll it later.
 
 ### 3. Timeout Delay Queue
-Unpaid orders are scheduled for cancellation by adding their ID, flight ID, and seat code to a Redis Sorted Set (`order:timeout:zset`) with a Unix timestamp score 60 seconds in the future. A background worker periodically polls the queue using a Lua script that executes `ZRANGEBYSCORE` and `ZREM` atomically to retrieve and claim due tasks without duplicate execution across workers. If releasing a seat in Redis fails after database cancellation, the worker retries up to three times with backoff before logging an error for manual review. This setup avoids maintaining in-memory sleep timers that would be lost on server restart. Because the polling loop runs on a fixed one-second interval, order cancellation has a time resolution of up to one second.
+Unpaid orders are scheduled for cancellation by adding their ID, flight ID, and seat code to a Redis Sorted Set (`order:timeout:zset`) with a Unix timestamp score 60 seconds in the future. A background worker periodically polls the queue using a Lua script that executes `ZRANGEBYSCORE` and `ZREM` atomically to retrieve and claim due tasks without duplicate execution across workers. If executing the database cancellation fails due to transient connection errors, the worker re-queues the popped task into the ZSet with a 5-second delay (up to three attempts) to avoid message loss upon pop. If releasing a seat in Redis fails after database cancellation, the worker retries up to three times with backoff before logging an error for manual review. This setup avoids maintaining in-memory sleep timers that would be lost on server restart. Because the polling loop runs on a fixed one-second interval, order cancellation has a time resolution of up to one second.
 
 ```mermaid
 graph TD
     A[Order Created: Status = Pending] --> B["Add to Redis ZSet with score = now + 60s"]
     B --> C["Background worker polls ZSet atomically via Lua"]
     C -->|Due Task Popped| D["Execute conditional update: UPDATE orders SET status='Cancelled' WHERE id=:id AND status='Pending'"]
+    D -->|DB Exception: transient error| I["Re-queue to Redis ZSet with 5s delay: max 3 retries"]
+    I --> B
     D -->|rowcount == 0: already paid or cancelled| E[Discard - Skip seat release]
     D -->|rowcount == 1: cancelled successfully| F["Release Redis seat lock: HSET status=0"]
     F -->|Success| G[Seat released to available]
@@ -149,7 +151,7 @@ User authentication uses JWT access tokens with a 15-minute expiration and refre
 
 ## Testing
 
-The test suite contains 46 tests: 40 integration tests execute against live PostgreSQL 15 and Redis 7 container instances, and 6 unit tests cover password hashing, JWT encoding/decoding, and client identifier parsing. Database test isolation is maintained by running each test inside an outer transaction with savepoints that roll back on completion, while Redis tests use database 15 and flush keys between runs. The GitHub Actions CI pipeline spins up the same PostgreSQL and Redis service containers and executes all tests automatically on push and pull requests.
+The test suite contains 49 tests: 43 integration tests execute against live PostgreSQL 15 and Redis 7 container instances, and 6 unit tests cover password hashing, JWT encoding/decoding, and client identifier parsing. Database test isolation is maintained by running each test inside an outer transaction with savepoints that roll back on completion, while Redis tests use database 15 and flush keys between runs. The GitHub Actions CI pipeline spins up the same PostgreSQL and Redis service containers and executes all tests automatically on push and pull requests.
 
 ### Concurrency Benchmark Results
 

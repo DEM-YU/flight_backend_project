@@ -31,6 +31,8 @@ _CACHE_TTL_JITTER = 300
 _CACHE_EMPTY_TTL = 60
 
 _ORDER_TIMEOUT_SECONDS = 60
+_ORDER_TIMEOUT_RETRY_DELAY = 5
+_ORDER_TIMEOUT_MAX_RETRIES = 3
 _SEAT_RELEASE_MAX_RETRIES = 3
 
 ORDER_TIMEOUT_QUEUE_KEY = "order:timeout:zset"
@@ -343,8 +345,18 @@ async def cancel_expired_order(
 
         logger.info("Order %s auto-cancelled by timeout worker", order_id)
 
+    return await release_seat_with_retry(redis, flight_id, seat_code, order_id)
+
+
+async def release_seat_with_retry(
+    redis: aioredis.Redis,
+    flight_id: str | UUID,
+    seat_code: str,
+    order_id: str | UUID,
+    max_retries: int = _SEAT_RELEASE_MAX_RETRIES,
+) -> bool:
     seat_key = f"flight:{flight_id}:seats"
-    for attempt in range(_SEAT_RELEASE_MAX_RETRIES):
+    for attempt in range(max_retries):
         try:
             await redis.hset(seat_key, seat_code, SeatState.AVAILABLE)
             logger.info(
@@ -355,10 +367,10 @@ async def cancel_expired_order(
         except Exception:
             logger.error(
                 "Failed to release seat %s on flight %s (attempt %d/%d)",
-                seat_code, flight_id, attempt + 1, _SEAT_RELEASE_MAX_RETRIES,
+                seat_code, flight_id, attempt + 1, max_retries,
                 exc_info=True,
             )
-            if attempt < _SEAT_RELEASE_MAX_RETRIES - 1:
+            if attempt < max_retries - 1:
                 await asyncio.sleep(1 * (attempt + 1))
 
     logger.critical(
@@ -366,7 +378,7 @@ async def cancel_expired_order(
         "is cancelled in DB. Manual intervention required.",
         seat_code, flight_id, order_id,
     )
-    return True
+    return False
 
 
 async def process_expired_orders(
@@ -387,9 +399,39 @@ async def process_expired_orders(
             await cancel_expired_order(
                 redis, task["order_id"], task["flight_id"], task["seat_code"]
             )
+            # Successfully processed; clear any retry counter
+            retry_key = f"order:timeout:retry:{task['order_id']}"
+            await redis.delete(retry_key)
             processed += 1
         except Exception:
-            logger.error("Error processing expired order payload %s", raw_task, exc_info=True)
+            logger.error(
+                "Error processing expired order payload %s, attempting retry re-queue",
+                raw_task,
+                exc_info=True,
+            )
+            try:
+                task = json.loads(raw_task)
+                retry_key = f"order:timeout:retry:{task['order_id']}"
+                retries = await redis.incr(retry_key)
+                await redis.expire(retry_key, 300)
+                if retries <= _ORDER_TIMEOUT_MAX_RETRIES:
+                    retry_ts = datetime.now(timezone.utc).timestamp() + _ORDER_TIMEOUT_RETRY_DELAY
+                    await redis.zadd(ORDER_TIMEOUT_QUEUE_KEY, {raw_task: retry_ts})
+                    logger.warning(
+                        "Order %s cancellation failed (attempt %d/%d), re-queued for retry in %ds",
+                        task["order_id"],
+                        retries,
+                        _ORDER_TIMEOUT_MAX_RETRIES,
+                        _ORDER_TIMEOUT_RETRY_DELAY,
+                    )
+                else:
+                    logger.critical(
+                        "Order %s cancellation exceeded max retries (%d). Dropping task to prevent poison pill.",
+                        task["order_id"],
+                        _ORDER_TIMEOUT_MAX_RETRIES,
+                    )
+            except Exception:
+                logger.error("Failed to re-queue failed order task %s", raw_task, exc_info=True)
 
     return processed
 
@@ -462,6 +504,7 @@ async def pay_order(
         })
         try:
             await redis.zrem(ORDER_TIMEOUT_QUEUE_KEY, order_task)
+            await redis.delete(f"order:timeout:retry:{order.id}")
             logger.info("Order %s removed from Redis timeout queue after payment", order.id)
         except Exception:
             logger.warning(
@@ -506,11 +549,11 @@ async def cancel_order_by_user(
         })
         try:
             await redis.zrem(ORDER_TIMEOUT_QUEUE_KEY, order_task)
-            seat_key = f"flight:{order.flight_id}:seats"
-            await redis.hset(seat_key, order.seat_code, SeatState.AVAILABLE)
+            await redis.delete(f"order:timeout:retry:{order.id}")
         except Exception:
             logger.warning(
-                "Failed to release seat or purge queue for order %s", order.id, exc_info=True
+                "Failed to purge timeout queue for order %s", order.id, exc_info=True
             )
+        await release_seat_with_retry(redis, order.flight_id, order.seat_code, order.id)
 
     return order

@@ -1,6 +1,7 @@
 import json
 import uuid
 from datetime import date, datetime, timezone
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from sqlalchemy import select
@@ -21,6 +22,7 @@ from services import (
     get_flight_seat_map,
     pay_order,
     process_expired_orders,
+    release_seat_with_retry,
     reserve_seat,
     schedule_order_timeout,
     search_flights,
@@ -328,6 +330,74 @@ class TestRedisZSetTimeoutQueue:
                 await db.execute(delete(Flight).where(Flight.id == flight.id))
                 await db.execute(delete(User).where(User.id == user.id))
                 await db.commit()
+
+    async def test_process_expired_orders_requeues_with_delay_on_db_failure(self, redis_client):
+        """Fault injection test: If cancel_expired_order throws DB/network error,
+        the task must be re-added to Redis ZSet with a delay rather than being lost."""
+        order_id = str(uuid.uuid4())
+        flight_id = str(uuid.uuid4())
+        seat_code = "8F"
+
+        await schedule_order_timeout(redis_client, order_id, flight_id, seat_code, delay=-1)
+
+        raw_task = json.dumps({
+            "order_id": order_id,
+            "flight_id": flight_id,
+            "seat_code": seat_code,
+        })
+
+        # Inject simulated database connection crash
+        with patch("services.cancel_expired_order", new_callable=AsyncMock) as mock_cancel:
+            mock_cancel.side_effect = RuntimeError("Database connection timed out")
+            before_process = datetime.now(timezone.utc).timestamp()
+            processed_count = await process_expired_orders(redis_client)
+
+            # Processing failed, so returned count is 0
+            assert processed_count == 0
+
+        # CRITICAL ASSERTION: Task was NOT lost upon pop! It must be re-queued in ZSet
+        new_score = await redis_client.zscore(ORDER_TIMEOUT_QUEUE_KEY, raw_task)
+        assert new_score is not None
+        # Must be delayed by ~5 seconds into the future
+        assert new_score >= before_process + 4.0
+
+        # Retry counter in Redis must be incremented
+        retries = await redis_client.get(f"order:timeout:retry:{order_id}")
+        assert str(retries) == "1"
+
+        # Cleanup
+        await redis_client.zrem(ORDER_TIMEOUT_QUEUE_KEY, raw_task)
+        await redis_client.delete(f"order:timeout:retry:{order_id}")
+
+    async def test_process_expired_orders_drops_after_max_retries(self, redis_client):
+        """Poison pill prevention: If a task repeatedly fails beyond max retries,
+        it should be dropped from the queue to prevent infinite retry loops."""
+        order_id = str(uuid.uuid4())
+        flight_id = str(uuid.uuid4())
+        seat_code = "9C"
+
+        await schedule_order_timeout(redis_client, order_id, flight_id, seat_code, delay=-1)
+
+        raw_task = json.dumps({
+            "order_id": order_id,
+            "flight_id": flight_id,
+            "seat_code": seat_code,
+        })
+
+        # Pre-set retry counter to 3 (max retries reached)
+        await redis_client.set(f"order:timeout:retry:{order_id}", "3")
+
+        with patch("services.cancel_expired_order", new_callable=AsyncMock) as mock_cancel:
+            mock_cancel.side_effect = RuntimeError("Permanent database corruption")
+            processed_count = await process_expired_orders(redis_client)
+            assert processed_count == 0
+
+        # Task must NOT be re-queued anymore
+        new_score = await redis_client.zscore(ORDER_TIMEOUT_QUEUE_KEY, raw_task)
+        assert new_score is None
+
+        # Cleanup
+        await redis_client.delete(f"order:timeout:retry:{order_id}")
 
 
 class TestPayOrder:
@@ -669,6 +739,47 @@ class TestCancelOrderByUser:
 
         with pytest.raises(InvalidOrderStatusException):
             await cancel_order_by_user(db_session, order.id, user.id)
+
+    async def test_cancel_order_by_user_retries_redis_seat_release(self, db_session, redis_client):
+        """Verify cancel_order_by_user retries releasing Redis seat if initial attempt fails."""
+        user = await _create_test_user(db_session)
+        flight = await _create_test_flight(db_session)
+        await _create_test_seat(db_session, flight.id, "12E", status=0)
+
+        order = Order(
+            id=uuid.uuid4(),
+            user_id=user.id,
+            flight_id=flight.id,
+            seat_code="12E",
+            status=OrderStatus.PENDING,
+        )
+        db_session.add(order)
+        await db_session.commit()
+
+        seat_key = f"flight:{flight.id}:seats"
+        await redis_client.hset(seat_key, "12E", SeatState.LOCKED)
+
+        # First hset call raises Redis connection error, second succeeds
+        real_hset = redis_client.hset
+        attempt_count = 0
+
+        async def flaky_hset(name, key=None, value=None, mapping=None, items=None):
+            nonlocal attempt_count
+            if name == seat_key and key == "12E":
+                attempt_count += 1
+                if attempt_count == 1:
+                    raise RuntimeError("Transient Redis connection drop")
+            return await real_hset(name, key=key, value=value, mapping=mapping, items=items)
+
+        with patch.object(redis_client, "hset", side_effect=flaky_hset):
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                cancelled = await cancel_order_by_user(db_session, order.id, user.id, redis=redis_client)
+                assert cancelled.status == OrderStatus.CANCELLED
+
+        # Verify retry took place and seat was successfully freed
+        assert attempt_count == 2
+        redis_status = await redis_client.hget(seat_key, "12E")
+        assert redis_status == SeatState.AVAILABLE
 
 
 class TestCancelOrderAPI:
