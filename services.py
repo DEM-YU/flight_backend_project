@@ -45,6 +45,14 @@ end
 return items
 """
 
+HYDRATE_SEAT_MAP_SCRIPT = """
+local key = KEYS[1]
+for i = 1, #ARGV, 2 do
+    redis.call('HSETNX', key, ARGV[i], ARGV[i + 1])
+end
+return 1
+"""
+
 
 
 
@@ -198,8 +206,24 @@ async def get_flight_seat_map(
         ).scalars().all()
 
         if seats:
-            seat_map = {s.seat_code: str(s.status) for s in seats}
-            await redis.hset(seat_key, mapping=seat_map)
+            # Query active orders (PENDING or CONFIRMED) so that in-flight reservations
+            # or pending orders are not displayed as available after Redis cache rebuild.
+            active_orders_stmt = select(Order.seat_code).where(
+                Order.flight_id == flight_id,
+                Order.status.in_([OrderStatus.PENDING, OrderStatus.CONFIRMED]),
+            )
+            active_seats = set(
+                (await db.execute(active_orders_stmt)).scalars().all()
+            )
+
+            args = []
+            for s in seats:
+                is_locked = (s.status == 1 or s.seat_code in active_seats)
+                args.extend([s.seat_code, str(SeatState.LOCKED if is_locked else SeatState.AVAILABLE)])
+
+            # Use HSETNX via Lua script so concurrent reservation locks are NOT overwritten
+            await redis.eval(HYDRATE_SEAT_MAP_SCRIPT, 1, seat_key, *args)
+            seat_map = await redis.hgetall(seat_key)
         else:
             seat_map = {}
 
@@ -505,7 +529,9 @@ async def pay_order(
         try:
             await redis.zrem(ORDER_TIMEOUT_QUEUE_KEY, order_task)
             await redis.delete(f"order:timeout:retry:{order.id}")
-            logger.info("Order %s removed from Redis timeout queue after payment", order.id)
+            seat_key = f"flight:{order.flight_id}:seats"
+            await redis.hset(seat_key, order.seat_code, SeatState.LOCKED)
+            logger.info("Order %s paid; timeout queue cleared and seat confirmed locked in Redis", order.id)
         except Exception:
             logger.warning(
                 "Failed to remove paid order %s from timeout queue", order.id, exc_info=True

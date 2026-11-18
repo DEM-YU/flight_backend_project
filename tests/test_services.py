@@ -150,6 +150,86 @@ class TestFlightSeatMap:
         assert seat_1b.is_available is True
         assert seat_1b.status == 0
 
+    async def test_get_seat_map_hydrates_pending_and_confirmed_orders_from_db(self, db_session, redis_client):
+        """Verify Cache-Aside Hydration: Active Pending and Confirmed orders are hydrated as LOCKED."""
+        flight = await _create_test_flight(db_session)
+        user = await _create_test_user(db_session)
+        await _create_test_seat(db_session, flight.id, "3A", status=0)
+        await _create_test_seat(db_session, flight.id, "3B", status=0)
+        await _create_test_seat(db_session, flight.id, "3C", status=0)
+
+        # 3A has an active PENDING order (seat table still says status=0)
+        order_pending = Order(
+            id=uuid.uuid4(),
+            user_id=user.id,
+            flight_id=flight.id,
+            seat_code="3A",
+            status=OrderStatus.PENDING,
+        )
+        # 3B has an active CONFIRMED order
+        order_confirmed = Order(
+            id=uuid.uuid4(),
+            user_id=user.id,
+            flight_id=flight.id,
+            seat_code="3B",
+            status=OrderStatus.CONFIRMED,
+        )
+        db_session.add(order_pending)
+        db_session.add(order_confirmed)
+        await db_session.commit()
+
+        # Wipe Redis cache to simulate cache eviction / cold start
+        seat_key = f"flight:{flight.id}:seats"
+        await redis_client.delete(seat_key)
+
+        seat_map = await get_flight_seat_map(db_session, redis_client, flight.id)
+        assert seat_map.total_seats == 3
+        assert seat_map.available_seats == 1
+
+        seat_3a = next(s for s in seat_map.seats if s.seat_code == "3A")
+        seat_3b = next(s for s in seat_map.seats if s.seat_code == "3B")
+        seat_3c = next(s for s in seat_map.seats if s.seat_code == "3C")
+
+        assert seat_3a.is_available is False
+        assert seat_3a.status == 1
+        assert seat_3b.is_available is False
+        assert seat_3b.status == 1
+        assert seat_3c.is_available is True
+        assert seat_3c.status == 0
+
+        # Verify Redis was written correctly
+        cached = await redis_client.hgetall(seat_key)
+        assert cached == {"3A": "1", "3B": "1", "3C": "0"}
+
+    async def test_get_seat_map_hydration_preserves_concurrently_locked_seat_via_hsetnx(self, db_session, redis_client):
+        """Verify HSETNX: Hydration does not overwrite a seat that was concurrently locked in Redis."""
+        flight = await _create_test_flight(db_session)
+        await _create_test_seat(db_session, flight.id, "4A", status=0)
+        await _create_test_seat(db_session, flight.id, "4B", status=0)
+
+        seat_key = f"flight:{flight.id}:seats"
+        # Redis starts empty (cache miss)
+        await redis_client.delete(seat_key)
+
+        # Simulate race condition: Thread B locks 4A concurrently while Thread A is hydrating
+        real_eval = redis_client.eval
+        async def race_eval(script, numkeys, *keys_and_args):
+            # Concurrent reservation by Thread B happens right before hydration writes
+            await redis_client.hset(seat_key, "4A", SeatState.LOCKED)
+            return await real_eval(script, numkeys, *keys_and_args)
+
+        with patch.object(redis_client, "eval", side_effect=race_eval):
+            seat_map = await get_flight_seat_map(db_session, redis_client, flight.id)
+
+        # 4A must still be LOCKED ('1') in Redis, NOT overwritten by DB's status=0
+        cached = await redis_client.hgetall(seat_key)
+        assert cached["4A"] == "1"
+        assert cached["4B"] == "0"
+
+        seat_4a = next(s for s in seat_map.seats if s.seat_code == "4A")
+        assert seat_4a.is_available is False
+        assert seat_4a.status == 1
+
     async def test_get_seat_map_non_existent_flight_raises_404(self, db_session, redis_client):
         fake_id = uuid.uuid4()
         with pytest.raises(FlightNotFoundException):
@@ -518,6 +598,36 @@ class TestPayOrder:
         })
         score = await redis_client.zscore(ORDER_TIMEOUT_QUEUE_KEY, task_payload)
         assert score is None
+
+        # Also confirm seat is LOCKED in Redis
+        seat_key = f"flight:{flight.id}:seats"
+        assert await redis_client.hget(seat_key, "14B") == SeatState.LOCKED
+
+    async def test_pay_order_confirms_seat_locked_in_redis(self, db_session, redis_client):
+        """Verify pay_order explicitly confirms seat state as LOCKED in Redis."""
+        user = await _create_test_user(db_session)
+        flight = await _create_test_flight(db_session)
+        await _create_test_seat(db_session, flight.id, "15C", status=0)
+
+        order = Order(
+            id=uuid.uuid4(),
+            user_id=user.id,
+            flight_id=flight.id,
+            seat_code="15C",
+            status=OrderStatus.PENDING,
+        )
+        db_session.add(order)
+        await db_session.commit()
+
+        # Seat key in Redis starts as available
+        seat_key = f"flight:{flight.id}:seats"
+        await redis_client.hset(seat_key, "15C", SeatState.AVAILABLE)
+
+        await pay_order(db_session, order.id, user.id, redis=redis_client)
+
+        # After payment, Redis seat must be confirmed as LOCKED ('1')
+        seat_status = await redis_client.hget(seat_key, "15C")
+        assert seat_status == SeatState.LOCKED
 
 
 class TestPayOrderAPI:
