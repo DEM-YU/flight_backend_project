@@ -3,6 +3,7 @@ import uuid
 import redis.asyncio as aioredis
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 import jwt
 
@@ -27,18 +28,26 @@ router = APIRouter(prefix="/api/v1/auth", tags=["Auth"])
 
 @router.post("/register", status_code=status.HTTP_201_CREATED)
 async def register(req: RegisterRequest, db: Annotated[AsyncSession, Depends(get_db)]):
-    stmt = select(User).where(User.email == req.email.strip().lower())
+    email = req.email.strip().lower()
+    stmt = select(User).where(User.email == email)
     existing_user = (await db.execute(stmt)).scalar_one_or_none()
     if existing_user:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
+            status_code=status.HTTP_409_CONFLICT,
             detail="Email already registered."
         )
 
     hashed = hash_password(req.password)
-    user = User(email=req.email.strip().lower(), hashed_password=hashed)
+    user = User(email=email, hashed_password=hashed)
     db.add(user)
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Email already registered."
+        )
     return {"message": "User registered successfully.", "email": user.email}
 
 

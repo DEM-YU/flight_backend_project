@@ -58,5 +58,6 @@ jobs:
           POSTGRES_USER: flight_user
           POSTGRES_PASSWORD: flight_pass
           REDIS_URL: redis://localhost:6379
+          JWT_SECRET_KEY: test-secret-key-for-testing-only-123456
         run: |
           pytest -v

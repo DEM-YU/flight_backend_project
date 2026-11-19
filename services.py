@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 _CACHE_TTL_BASE = 1800
 _CACHE_TTL_JITTER = 300
-# Short TTL for empty results so newly added flights become visible quickly.
+# Negative cache TTL
 _CACHE_EMPTY_TTL = 60
 
 _ORDER_TIMEOUT_SECONDS = 60
@@ -60,64 +60,57 @@ class BookingDomainException(Exception):
     status_code: int = 500
     detail: str = "Internal server error"
 
-    def __init__(self, detail: str | None = None):
+    def __init__(self, detail: str | None = None, status_code: int | None = None):
         if detail:
             self.detail = detail
+        if status_code:
+            self.status_code = status_code
         super().__init__(self.detail)
 
 
-class NotFoundException(BookingDomainException):
-    status_code: int = 404
-    detail: str = "Resource not found"
+class FlightNotFoundException(BookingDomainException):
+    status_code = 404
 
-
-class ConflictException(BookingDomainException):
-    status_code: int = 409
-    detail: str = "Resource conflict"
-
-
-class ForbiddenException(BookingDomainException):
-    status_code: int = 403
-    detail: str = "Access forbidden"
-
-
-class BadRequestException(BookingDomainException):
-    status_code: int = 400
-    detail: str = "Bad request"
-
-
-class FlightNotFoundException(NotFoundException):
     def __init__(self, flight_id: str | UUID):
         super().__init__(f"Flight {flight_id} not found.")
 
 
-class SeatUnavailableException(ConflictException):
-    def __init__(self, detail: str = "Seat is already reserved or unavailable."):
-        super().__init__(detail)
+class SeatNotFoundException(BookingDomainException):
+    status_code = 404
 
-
-class SeatNotFoundException(NotFoundException):
     def __init__(self, detail: str = "Seat does not exist or flight seat map is not initialized."):
         super().__init__(detail)
 
 
-class OrderNotFoundException(NotFoundException):
+class SeatUnavailableException(BookingDomainException):
+    status_code = 409
+
+    def __init__(self, detail: str = "Seat is already reserved or unavailable."):
+        super().__init__(detail)
+
+
+class OrderNotFoundException(BookingDomainException):
+    status_code = 404
+
     def __init__(self, order_id: str | UUID):
         super().__init__(f"Order {order_id} not found.")
 
 
-class OrderForbiddenException(ForbiddenException):
-    def __init__(self, detail: str = "You do not have permission to pay for this order."):
+class OrderForbiddenException(BookingDomainException):
+    status_code = 403
+
+    def __init__(self, detail: str = "You do not have permission to access this order."):
         super().__init__(detail)
 
 
-class InvalidOrderStatusException(BadRequestException):
+class InvalidOrderStatusException(BookingDomainException):
+    status_code = 409
+
     def __init__(self, detail: str = "Order already processed or expired."):
         super().__init__(detail)
 
 
-# Lua check-and-set: HGET nil means seat was never initialized, distinct from
-# already-locked. Single EVAL round-trip avoids WATCH/MULTI race windows.
+# Returns: -1 (uninitialized), 1 (locked), 0 (unavailable)
 RESERVE_SEAT_SCRIPT = """
 local status = redis.call('HGET', KEYS[1], ARGV[1])
 if status == false then
@@ -166,7 +159,7 @@ async def search_flights(
     flights = (await db.execute(stmt)).scalars().all()
     flight_responses = [FlightResponse.model_validate(f) for f in flights]
 
-    # Jitter avoids thundering-herd on TTL expiry across multiple keys.
+    # Base TTL + jitter
     cache_payload = json.dumps([f.model_dump(mode="json") for f in flight_responses])
     ttl = (
         _CACHE_EMPTY_TTL if not flight_responses
@@ -192,7 +185,7 @@ async def get_flight_seat_map(
     seat_map = await redis.hgetall(seat_key)
 
     if not seat_map:
-        # Cache miss: query PostgreSQL for flight and seats
+        # Query DB on cache miss
         flight = (
             await db.execute(select(Flight).where(Flight.id == flight_id))
         ).scalar_one_or_none()
@@ -206,8 +199,7 @@ async def get_flight_seat_map(
         ).scalars().all()
 
         if seats:
-            # Query active orders (PENDING or CONFIRMED) so that in-flight reservations
-            # or pending orders are not displayed as available after Redis cache rebuild.
+            # Sync active orders so unconfirmed reservations display as locked
             active_orders_stmt = select(Order.seat_code).where(
                 Order.flight_id == flight_id,
                 Order.status.in_([OrderStatus.PENDING, OrderStatus.CONFIRMED]),
@@ -221,7 +213,7 @@ async def get_flight_seat_map(
                 is_locked = (s.status == 1 or s.seat_code in active_seats)
                 args.extend([s.seat_code, str(SeatState.LOCKED if is_locked else SeatState.AVAILABLE)])
 
-            # Use HSETNX via Lua script so concurrent reservation locks are NOT overwritten
+            # HSETNX prevents overwriting concurrent locks
             await redis.eval(HYDRATE_SEAT_MAP_SCRIPT, 1, seat_key, *args)
             seat_map = await redis.hgetall(seat_key)
         else:
@@ -279,8 +271,7 @@ async def reserve_seat(
 
     lock_status = await redis.eval(RESERVE_SEAT_SCRIPT, 1, seat_key, seat_code)
     if lock_status == -1:
-        # Cache-Aside: Seat map may not be in Redis yet (e.g. server restart or new flight).
-        # Hydrate seat map from PostgreSQL and retry atomic locking once.
+        # Hydrate from DB on miss and retry lock once
         try:
             await get_flight_seat_map(db, redis, flight_id)
             lock_status = await redis.eval(RESERVE_SEAT_SCRIPT, 1, seat_key, seat_code)
@@ -296,7 +287,7 @@ async def reserve_seat(
             f"Seat {seat_code} on flight {flight_id} is unavailable."
         )
 
-    # 1. Persist Pending order to PostgreSQL
+    # 1. Persist pending order
     try:
         order = Order(
             id=uuid.uuid4(),
@@ -311,18 +302,18 @@ async def reserve_seat(
     except IntegrityError as exc:
         await db.rollback()
         err_msg = str(exc).lower()
-        if "uq_flight_seat_active_order" in err_msg or "unique" in err_msg:
+        if "uq_flight_seat_active_order" in err_msg:
             logger.warning(
                 "Database rejected reservation for seat %s on flight %s due to duplicate active order: %s",
                 seat_code, flight_id, exc,
             )
-            # Defensive baseline: Seat is already booked in PostgreSQL. Sync Redis to LOCKED.
+            # Active order exists in DB; sync Redis to locked
             await redis.hset(seat_key, seat_code, SeatState.LOCKED)
             raise SeatUnavailableException(
                 f"Seat {seat_code} on flight {flight_id} is unavailable."
             ) from exc
         else:
-            # Foreign key or other integrity error: seat is NOT booked in DB, rollback Redis lock
+            # Rollback Redis lock on other integrity error
             logger.error(
                 "DB integrity violation for seat %s on flight %s, rolling back Redis lock: %s",
                 seat_code, flight_id, exc,
@@ -338,9 +329,7 @@ async def reserve_seat(
         await redis.hset(seat_key, seat_code, SeatState.AVAILABLE)
         raise
 
-    # 2. Schedule expiration in Redis ZSet delay queue.
-    # If queue scheduling fails, execute compensating cancellation to prevent ghost Pending orders.
-    # This block is separated from DB creation so failures here do not trigger DB rollback or redundant Redis unlock.
+    # 2. Enqueue timeout task; compensate on failure
     try:
         await schedule_order_timeout(
             redis, str(order.id), str(flight_id), seat_code, delay=timeout_delay
@@ -382,10 +371,10 @@ async def cancel_expired_order(
     order_id: str,
     flight_id: str,
     seat_code: str,
+    db: AsyncSession | None = None,
 ) -> bool:
-    async with AsyncSessionLocal() as db:
-        # Atomic CAS: Only cancel if order is still strictly PENDING.
-        # If the user paid concurrently, rowcount will be 0 and seat release is skipped.
+    if db is not None:
+        # Cancel only if order is still PENDING
         stmt = (
             update(Order)
             .where(Order.id == UUID(order_id), Order.status == OrderStatus.PENDING)
@@ -393,6 +382,26 @@ async def cancel_expired_order(
         )
         result = await db.execute(stmt)
         await db.commit()
+
+        if result.rowcount == 0:
+            logger.info(
+                "Order %s timeout check: order not found or already processed (paid/cancelled), skipping seat release",
+                order_id,
+            )
+            return False
+
+        logger.info("Order %s auto-cancelled by timeout worker", order_id)
+        return await release_seat_with_retry(redis, flight_id, seat_code, order_id)
+
+    async with AsyncSessionLocal() as session:
+        # Cancel only if order is still PENDING
+        stmt = (
+            update(Order)
+            .where(Order.id == UUID(order_id), Order.status == OrderStatus.PENDING)
+            .values(status=OrderStatus.CANCELLED)
+        )
+        result = await session.execute(stmt)
+        await session.commit()
 
         if result.rowcount == 0:
             logger.info(
@@ -442,6 +451,7 @@ async def release_seat_with_retry(
 async def process_expired_orders(
     redis: aioredis.Redis,
     batch_size: int = 50,
+    db: AsyncSession | None = None,
 ) -> int:
     now_ts = datetime.now(timezone.utc).timestamp()
     due_orders = await redis.eval(
@@ -455,9 +465,9 @@ async def process_expired_orders(
         try:
             task = json.loads(raw_task)
             await cancel_expired_order(
-                redis, task["order_id"], task["flight_id"], task["seat_code"]
+                redis, task["order_id"], task["flight_id"], task["seat_code"], db=db
             )
-            # Successfully processed; clear any retry counter
+            # Clear retry counter on success
             retry_key = f"order:timeout:retry:{task['order_id']}"
             await redis.delete(retry_key)
             processed += 1
@@ -528,8 +538,7 @@ async def pay_order(
     if order.user_id != user_id:
         raise OrderForbiddenException("You do not have permission to pay for this order.")
 
-    # Atomic CAS update: only update if status is still PENDING.
-    # Prevents race condition where the timeout worker auto-cancels concurrently.
+    # Update status only if still PENDING
     stmt = (
         update(Order)
         .where(Order.id == order_id, Order.status == OrderStatus.PENDING)
@@ -553,7 +562,7 @@ async def pay_order(
     await db.refresh(order)
     logger.info("Order %s confirmed and paid by user %s", order_id, user_id)
 
-    # Proactively remove the task from Redis ZSet timeout queue to avoid worker polling overhead
+    # Purge task from timeout queue
     if redis is not None:
         order_task = json.dumps({
             "order_id": str(order.id),

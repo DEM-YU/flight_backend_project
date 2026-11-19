@@ -6,7 +6,7 @@ from typing import Annotated
 import redis.asyncio as aioredis
 from fastapi import Depends, FastAPI, Request, Response
 from fastapi.responses import JSONResponse
-from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import RedisError
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -66,9 +66,9 @@ async def db_exception_handler(request: Request, exc: OperationalError) -> JSONR
     )
 
 
-@app.exception_handler(RedisConnectionError)
-async def redis_exception_handler(request: Request, exc: RedisConnectionError) -> JSONResponse:
-    logger.error("Redis connection error on %s: %s", request.url.path, exc, exc_info=True)
+@app.exception_handler(RedisError)
+async def redis_exception_handler(request: Request, exc: RedisError) -> JSONResponse:
+    logger.error("Redis error on %s: %s", request.url.path, exc, exc_info=True)
     return JSONResponse(
         status_code=503,
         content={"detail": "Service temporarily unavailable. Please retry."},

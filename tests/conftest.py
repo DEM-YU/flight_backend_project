@@ -1,4 +1,7 @@
+import os
 from typing import AsyncGenerator
+
+os.environ.setdefault("JWT_SECRET_KEY", "test-secret-key-for-testing-only-123456")
 
 import pytest_asyncio
 import redis.asyncio as aioredis

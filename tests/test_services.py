@@ -356,6 +356,33 @@ class TestReserveSeat:
         seat_status = await redis_client.hget(seat_key, "5A")
         assert seat_status == SeatState.LOCKED
 
+    async def test_reserve_seat_non_active_order_unique_error_rolls_back_lock(
+        self, db_session, redis_client
+    ):
+        """Verify precision of unique constraint check:
+        Only uq_flight_seat_active_order should mark Redis as LOCKED.
+        Other integrity errors (even containing the word 'unique') must rollback Redis lock to AVAILABLE."""
+        from sqlalchemy.exc import IntegrityError
+
+        user = await _create_test_user(db_session)
+        flight = await _create_test_flight(db_session)
+        await _create_test_seat(db_session, flight.id, "8C")
+
+        seat_key = f"flight:{flight.id}:seats"
+        await redis_client.hset(seat_key, "8C", SeatState.AVAILABLE)
+
+        with patch.object(
+            db_session,
+            "commit",
+            side_effect=IntegrityError("duplicate key value violates unique constraint 'users_email_key'", params={}, orig=Exception()),
+        ):
+            with pytest.raises(IntegrityError):
+                await reserve_seat(db_session, redis_client, user.id, flight.id, "8C")
+
+        # Must NOT lock Redis to '1'; it must rollback Redis lock to AVAILABLE ('0')
+        seat_status = await redis_client.hget(seat_key, "8C")
+        assert seat_status == SeatState.AVAILABLE
+
     async def test_reserve_seat_compensates_if_timeout_scheduling_fails(
         self, db_session, redis_client, caplog
     ):
@@ -392,58 +419,45 @@ class TestReserveSeat:
 
 
 class TestRedisZSetTimeoutQueue:
-    async def test_schedule_and_process_expired_orders(self, redis_client):
-        from database import AsyncSessionLocal
+    async def test_schedule_and_process_expired_orders(self, db_session, redis_client):
+        user = await _create_test_user(db_session)
+        flight = await _create_test_flight(db_session)
+        seat = await _create_test_seat(db_session, flight.id, "7D")
 
-        async with AsyncSessionLocal() as db:
-            user = await _create_test_user(db)
-            flight = await _create_test_flight(db)
-            seat = await _create_test_seat(db, flight.id, "7D")
+        order = Order(
+            id=uuid.uuid4(),
+            user_id=user.id,
+            flight_id=flight.id,
+            seat_code="7D",
+            status=OrderStatus.PENDING,
+        )
+        db_session.add(order)
+        await db_session.commit()
 
-            order = Order(
-                id=uuid.uuid4(),
-                user_id=user.id,
-                flight_id=flight.id,
-                seat_code="7D",
-                status=OrderStatus.PENDING,
-            )
-            db.add(order)
-            await db.commit()
+        # Lock seat in Redis
+        seat_key = f"flight:{flight.id}:seats"
+        await redis_client.hset(seat_key, "7D", SeatState.LOCKED)
 
-        try:
-            # Lock seat in Redis
-            seat_key = f"flight:{flight.id}:seats"
-            await redis_client.hset(seat_key, "7D", SeatState.LOCKED)
+        # Schedule timeout with delay=-1 so score < now (immediately due)
+        await schedule_order_timeout(redis_client, str(order.id), str(flight.id), "7D", delay=-1)
 
-            # Schedule timeout with delay=-1 so score < now (immediately due)
-            await schedule_order_timeout(redis_client, str(order.id), str(flight.id), "7D", delay=-1)
+        # Verify entry exists in ZSet
+        zcount = await redis_client.zcard(ORDER_TIMEOUT_QUEUE_KEY)
+        assert zcount >= 1
 
-            # Verify entry exists in ZSet
-            zcount = await redis_client.zcard(ORDER_TIMEOUT_QUEUE_KEY)
-            assert zcount >= 1
+        # Process due orders using Redis Lua script and cancel_expired_order worker
+        processed_count = await process_expired_orders(redis_client, db=db_session)
+        assert processed_count >= 1
 
-            # Process due orders using Redis Lua script and cancel_expired_order worker
-            processed_count = await process_expired_orders(redis_client)
-            assert processed_count >= 1
+        # Redis seat lock must be released back to '0'
+        seat_state = await redis_client.hget(seat_key, "7D")
+        assert seat_state == SeatState.AVAILABLE
 
-            # Redis seat lock must be released back to '0'
-            seat_state = await redis_client.hget(seat_key, "7D")
-            assert seat_state == SeatState.AVAILABLE
-
-            # Database order status must be cancelled
-            async with AsyncSessionLocal() as db:
-                res = await db.execute(select(Order).where(Order.id == order.id))
-                refreshed_order = res.scalar_one_or_none()
-                assert refreshed_order is not None
-                assert refreshed_order.status == OrderStatus.CANCELLED
-        finally:
-            from sqlalchemy import delete
-            async with AsyncSessionLocal() as db:
-                await db.execute(delete(Order).where(Order.id == order.id))
-                await db.execute(delete(Seat).where(Seat.flight_id == flight.id))
-                await db.execute(delete(Flight).where(Flight.id == flight.id))
-                await db.execute(delete(User).where(User.id == user.id))
-                await db.commit()
+        # Database order status must be cancelled
+        res = await db_session.execute(select(Order).where(Order.id == order.id))
+        refreshed_order = res.scalar_one_or_none()
+        assert refreshed_order is not None
+        assert refreshed_order.status == OrderStatus.CANCELLED
 
     async def test_process_expired_orders_requeues_with_delay_on_db_failure(self, redis_client):
         """Fault injection test: If cancel_expired_order throws DB/network error,
@@ -696,92 +710,99 @@ class TestPayOrderAPI:
         assert data["status"] == "Confirmed"
         assert data["id"] == str(order.id)
 
+    async def test_pay_endpoint_already_processed_returns_409(self, async_client, db_session):
+        import jwt
+        from database import settings
+
+        user = await _create_test_user(db_session)
+        flight = await _create_test_flight(db_session)
+        await _create_test_seat(db_session, flight.id, "8B", status=0)
+
+        order = Order(
+            id=uuid.uuid4(),
+            user_id=user.id,
+            flight_id=flight.id,
+            seat_code="8B",
+            status=OrderStatus.CANCELLED,
+        )
+        db_session.add(order)
+        await db_session.commit()
+
+        token = jwt.encode(
+            {"sub": str(user.id), "type": "access"},
+            settings.JWT_SECRET_KEY,
+            algorithm=settings.JWT_ALGORITHM,
+        )
+        headers = {"Authorization": f"Bearer {token}"}
+
+        resp = await async_client.post(f"/api/v1/orders/{order.id}/pay", headers=headers)
+        assert resp.status_code == 409
+        assert "already processed or expired" in resp.json()["detail"]
+
 
 class TestPayAndCancelConcurrency:
-    async def test_worker_skips_seat_release_if_order_already_paid(self, redis_client):
+    async def test_worker_skips_seat_release_if_order_already_paid(self, db_session, redis_client):
         """Verify atomic CAS: If user paid, timeout worker must not release Redis seat."""
-        async with AsyncSessionLocal() as db:
-            user = await _create_test_user(db)
-            flight = await _create_test_flight(db)
-            seat = await _create_test_seat(db, flight.id, "10A", status=0)
-            order = Order(
-                id=uuid.uuid4(),
-                user_id=user.id,
-                flight_id=flight.id,
-                seat_code="10A",
-                status=OrderStatus.PENDING,
-            )
-            db.add(order)
-            await db.commit()
+        user = await _create_test_user(db_session)
+        flight = await _create_test_flight(db_session)
+        seat = await _create_test_seat(db_session, flight.id, "10A", status=0)
+        order = Order(
+            id=uuid.uuid4(),
+            user_id=user.id,
+            flight_id=flight.id,
+            seat_code="10A",
+            status=OrderStatus.PENDING,
+        )
+        db_session.add(order)
+        await db_session.commit()
 
         seat_key = f"flight:{flight.id}:seats"
         await redis_client.hset(seat_key, "10A", SeatState.LOCKED)
 
-        try:
-            # 1. User pays the order -> status becomes CONFIRMED
-            async with AsyncSessionLocal() as db:
-                await pay_order(db, order.id, user.id)
+        # 1. User pays the order -> status becomes CONFIRMED
+        await pay_order(db_session, order.id, user.id)
 
-            # 2. Worker attempts to cancel -> CAS fails because status is not PENDING
-            cancelled = await cancel_expired_order(
-                redis_client, str(order.id), str(flight.id), "10A"
-            )
-            assert cancelled is False
+        # 2. Worker attempts to cancel -> CAS fails because status is not PENDING
+        cancelled = await cancel_expired_order(
+            redis_client, str(order.id), str(flight.id), "10A", db=db_session
+        )
+        assert cancelled is False
 
-            # 3. Redis seat must REMAIN LOCKED, NOT released to AVAILABLE ('0')
-            redis_seat_status = await redis_client.hget(seat_key, "10A")
-            assert redis_seat_status == SeatState.LOCKED
-        finally:
-            from sqlalchemy import delete
-            async with AsyncSessionLocal() as db:
-                await db.execute(delete(Order).where(Order.id == order.id))
-                await db.execute(delete(Seat).where(Seat.flight_id == flight.id))
-                await db.execute(delete(Flight).where(Flight.id == flight.id))
-                await db.execute(delete(User).where(User.id == user.id))
-                await db.commit()
+        # 3. Redis seat must REMAIN LOCKED, NOT released to AVAILABLE ('0')
+        redis_seat_status = await redis_client.hget(seat_key, "10A")
+        assert redis_seat_status == SeatState.LOCKED
 
-    async def test_pay_fails_if_worker_already_cancelled_order(self, redis_client):
+    async def test_pay_fails_if_worker_already_cancelled_order(self, db_session, redis_client):
         """Verify atomic CAS: If timeout worker cancelled order, payment attempt must fail."""
-        async with AsyncSessionLocal() as db:
-            user = await _create_test_user(db)
-            flight = await _create_test_flight(db)
-            seat = await _create_test_seat(db, flight.id, "11B", status=0)
-            order = Order(
-                id=uuid.uuid4(),
-                user_id=user.id,
-                flight_id=flight.id,
-                seat_code="11B",
-                status=OrderStatus.PENDING,
-            )
-            db.add(order)
-            await db.commit()
+        user = await _create_test_user(db_session)
+        flight = await _create_test_flight(db_session)
+        seat = await _create_test_seat(db_session, flight.id, "11B", status=0)
+        order = Order(
+            id=uuid.uuid4(),
+            user_id=user.id,
+            flight_id=flight.id,
+            seat_code="11B",
+            status=OrderStatus.PENDING,
+        )
+        db_session.add(order)
+        await db_session.commit()
 
         seat_key = f"flight:{flight.id}:seats"
         await redis_client.hset(seat_key, "11B", SeatState.LOCKED)
 
-        try:
-            # 1. Worker auto-cancels the order -> status becomes CANCELLED
-            cancelled = await cancel_expired_order(
-                redis_client, str(order.id), str(flight.id), "11B"
-            )
-            assert cancelled is True
+        # 1. Worker auto-cancels the order -> status becomes CANCELLED
+        cancelled = await cancel_expired_order(
+            redis_client, str(order.id), str(flight.id), "11B", db=db_session
+        )
+        assert cancelled is True
 
-            # 2. Redis seat must be released to AVAILABLE ('0')
-            redis_seat_status = await redis_client.hget(seat_key, "11B")
-            assert redis_seat_status == SeatState.AVAILABLE
+        # 2. Redis seat must be released to AVAILABLE ('0')
+        redis_seat_status = await redis_client.hget(seat_key, "11B")
+        assert redis_seat_status == SeatState.AVAILABLE
 
-            # 3. User attempts to pay afterwards -> atomic CAS fails and raises exception
-            async with AsyncSessionLocal() as db:
-                with pytest.raises(InvalidOrderStatusException):
-                    await pay_order(db, order.id, user.id)
-        finally:
-            from sqlalchemy import delete
-            async with AsyncSessionLocal() as db:
-                await db.execute(delete(Order).where(Order.id == order.id))
-                await db.execute(delete(Seat).where(Seat.flight_id == flight.id))
-                await db.execute(delete(Flight).where(Flight.id == flight.id))
-                await db.execute(delete(User).where(User.id == user.id))
-                await db.commit()
+        # 3. User attempts to pay afterwards -> atomic CAS fails and raises exception
+        with pytest.raises(InvalidOrderStatusException):
+            await pay_order(db_session, order.id, user.id)
 
 
 class TestCancelOrderByUser:
@@ -992,3 +1013,26 @@ class TestCancelOrderAPI:
 
         resp = await async_client.post(f"/api/v1/orders/{order.id}/cancel", headers=headers)
         assert resp.status_code == 403
+
+
+class TestGlobalExceptionHandler:
+    async def test_redis_timeout_error_returns_503(self, async_client):
+        """Verify Redis TimeoutError is handled by the global RedisError handler returning 503 instead of 500."""
+        from redis.exceptions import TimeoutError as RedisTimeoutError
+        with patch("api.get_flight_seat_map", side_effect=RedisTimeoutError("Redis socket read timed out")):
+            fake_id = uuid.uuid4()
+            resp = await async_client.get(f"/api/v1/flights/{fake_id}/seats")
+            assert resp.status_code == 503
+            assert "Service temporarily unavailable" in resp.json()["detail"]
+
+
+class TestSettingsSecurity:
+    async def test_settings_fails_fast_without_jwt_secret(self, monkeypatch):
+        """Verify fail-fast security baseline: Missing JWT_SECRET_KEY prevents application bootstrap."""
+        from pydantic import ValidationError
+        from database import Settings
+
+        monkeypatch.delenv("JWT_SECRET_KEY", raising=False)
+        with pytest.raises(ValidationError) as exc_info:
+            Settings(_env_file=None)
+        assert "JWT_SECRET_KEY" in str(exc_info.value)

@@ -87,8 +87,31 @@ class TestAuthAPI:
             "/api/v1/auth/register",
             json={"email": email, "password": "password123"},
         )
-        assert resp2.status_code == 400
+        assert resp2.status_code == 409
         assert "Email already registered" in resp2.json()["detail"]
+
+    async def test_register_concurrent_integrity_error_returns_409(
+        self, async_client, monkeypatch
+    ):
+        """Simulate concurrent TOCTOU race: db.commit() raises IntegrityError due to unique constraint collision."""
+        from sqlalchemy.exc import IntegrityError
+        from unittest.mock import AsyncMock
+
+        email = f"race_{uuid.uuid4().hex[:6]}@example.com"
+
+        # Mock db.commit() to raise IntegrityError simulating a race collision during registration
+        async def mock_commit_failure():
+            raise IntegrityError("duplicate key value violates unique constraint", params={}, orig=Exception())
+
+        # Use patch to simulate commit throwing IntegrityError
+        from unittest.mock import patch
+        with patch("sqlalchemy.ext.asyncio.AsyncSession.commit", side_effect=mock_commit_failure):
+            resp = await async_client.post(
+                "/api/v1/auth/register",
+                json={"email": email, "password": "password123"},
+            )
+            assert resp.status_code == 409
+            assert "Email already registered" in resp.json()["detail"]
 
     async def test_login_success(self, async_client, redis_client):
         email = f"login_{uuid.uuid4().hex[:6]}@example.com"

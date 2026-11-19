@@ -76,6 +76,17 @@ class TestRateLimiter:
         ident = limiter._extract_identifier(request)
         assert ident == "ip:203.0.113.195"
 
+    def test_extract_identifier_anonymous_prefers_x_forwarded_for(self):
+        limiter = RateLimiter(times=5, seconds=10)
+        request = _build_request(
+            path="/api/v1/orders/reserve",
+            client_ip="10.0.0.1",
+            headers={"X-Forwarded-For": "198.51.100.42, 10.0.0.1"},
+        )
+
+        ident = limiter._extract_identifier(request)
+        assert ident == "ip:198.51.100.42"
+
 
 class TestRateLimiterIntegration:
     @pytest.mark.asyncio

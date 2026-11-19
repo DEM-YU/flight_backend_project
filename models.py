@@ -75,8 +75,7 @@ class Order(Base):
     __tablename__ = "orders"
     __table_args__ = (
         Index("ix_order_status_created", "status", "created_at"),
-        # Defensive database baseline: partial unique index guaranteeing that for any given flight and seat,
-        # there can only be ONE active (Pending or Confirmed) order at any time.
+        # Prevent double-booking for active orders
         Index(
             "uq_flight_seat_active_order",
             "flight_id",
