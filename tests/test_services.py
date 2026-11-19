@@ -628,6 +628,10 @@ class TestPayOrder:
         db_session.add(order)
         await db_session.commit()
 
+        # Initialize seat in Redis as available
+        seat_key = f"flight:{flight.id}:seats"
+        await redis_client.hset(seat_key, "14B", SeatState.AVAILABLE)
+
         # 1. Schedule order timeout in Redis ZSet delay queue
         await schedule_order_timeout(redis_client, str(order.id), str(flight.id), "14B")
 
@@ -924,19 +928,20 @@ class TestCancelOrderByUser:
         seat_key = f"flight:{flight.id}:seats"
         await redis_client.hset(seat_key, "12E", SeatState.LOCKED)
 
-        # First hset call raises Redis connection error, second succeeds
-        real_hset = redis_client.hset
+        # First seat update call raises Redis connection error, second succeeds
+        import services
+        real_hset_if_exists = services._hset_seat_if_exists
         attempt_count = 0
 
-        async def flaky_hset(name, key=None, value=None, mapping=None, items=None):
+        async def flaky_hset_if_exists(redis, flight_id, seat_code, state):
             nonlocal attempt_count
-            if name == seat_key and key == "12E":
+            if seat_code == "12E":
                 attempt_count += 1
                 if attempt_count == 1:
                     raise RuntimeError("Transient Redis connection drop")
-            return await real_hset(name, key=key, value=value, mapping=mapping, items=items)
+            return await real_hset_if_exists(redis, flight_id, seat_code, state)
 
-        with patch.object(redis_client, "hset", side_effect=flaky_hset):
+        with patch("services._hset_seat_if_exists", side_effect=flaky_hset_if_exists):
             with patch("asyncio.sleep", new_callable=AsyncMock):
                 cancelled = await cancel_order_by_user(db_session, order.id, user.id, redis=redis_client)
                 assert cancelled.status == OrderStatus.CANCELLED
@@ -1036,3 +1041,111 @@ class TestSettingsSecurity:
         with pytest.raises(ValidationError) as exc_info:
             Settings(_env_file=None)
         assert "JWT_SECRET_KEY" in str(exc_info.value)
+
+
+class TestSeatMapPartialHashDefense:
+    async def test_release_seat_when_key_missing_does_not_corrupt_cache_and_hydrates_all_seats(
+        self, db_session, redis_client
+    ):
+        """Verify Bug-01 fix: Releasing a seat on an evicted/missing Redis key must not create
+        a 1-seat partial Hash, ensuring subsequent seat map queries hydrate all seats from DB.
+        """
+        flight = await _create_test_flight(db_session)
+        await _create_test_seat(db_session, flight.id, "1A", status=0)
+        await _create_test_seat(db_session, flight.id, "1B", status=0)
+        await _create_test_seat(db_session, flight.id, "1C", status=0)
+
+        seat_key = f"flight:{flight.id}:seats"
+        await redis_client.delete(seat_key)
+        assert await redis_client.exists(seat_key) == 0
+
+        # Attempt to release seat 1A while key is missing
+        fake_order_id = uuid.uuid4()
+        released = await release_seat_with_retry(redis_client, flight.id, "1A", fake_order_id)
+        assert released is True
+
+        # Crucial assertion: Redis key must NOT have been created with only 1A
+        assert await redis_client.exists(seat_key) == 0
+
+        # Subsequent seat map query must fully hydrate all 3 seats from PostgreSQL
+        seat_map = await get_flight_seat_map(db_session, redis_client, flight.id)
+        assert seat_map.total_seats == 3
+        assert seat_map.available_seats == 3
+        assert [s.seat_code for s in seat_map.seats] == ["1A", "1B", "1C"]
+
+    async def test_pay_order_when_key_missing_does_not_corrupt_cache_and_hydrates_correctly(
+        self, db_session, redis_client
+    ):
+        """Verify Bug-01 fix: Confirming payment on a missing Redis key must not create
+        a 1-seat partial Hash; full hydration must reflect the paid seat as locked.
+        """
+        user = await _create_test_user(db_session)
+        flight = await _create_test_flight(db_session)
+        await _create_test_seat(db_session, flight.id, "2A", status=0)
+        await _create_test_seat(db_session, flight.id, "2B", status=0)
+        await _create_test_seat(db_session, flight.id, "2C", status=0)
+
+        order = Order(
+            id=uuid.uuid4(),
+            user_id=user.id,
+            flight_id=flight.id,
+            seat_code="2A",
+            status=OrderStatus.PENDING,
+        )
+        db_session.add(order)
+        await db_session.commit()
+
+        seat_key = f"flight:{flight.id}:seats"
+        await redis_client.delete(seat_key)
+        assert await redis_client.exists(seat_key) == 0
+
+        # Pay order when key is missing in Redis
+        await pay_order(db_session, order.id, user.id, redis=redis_client)
+
+        # Redis key must NOT have been created
+        assert await redis_client.exists(seat_key) == 0
+
+        # Subsequent seat map query hydrates from DB, showing 2A locked and others available
+        seat_map = await get_flight_seat_map(db_session, redis_client, flight.id)
+        assert seat_map.total_seats == 3
+        assert seat_map.available_seats == 2
+        seat_2a = next(s for s in seat_map.seats if s.seat_code == "2A")
+        assert seat_2a.status == 1
+        assert seat_2a.is_available is False
+
+    async def test_timeout_cancellation_when_key_missing_does_not_corrupt_cache(
+        self, db_session, redis_client
+    ):
+        """Verify Bug-01 fix: Worker auto-cancellation on missing Redis key preserves DB hydration."""
+        user = await _create_test_user(db_session)
+        flight = await _create_test_flight(db_session)
+        await _create_test_seat(db_session, flight.id, "3A", status=0)
+        await _create_test_seat(db_session, flight.id, "3B", status=0)
+
+        order = Order(
+            id=uuid.uuid4(),
+            user_id=user.id,
+            flight_id=flight.id,
+            seat_code="3A",
+            status=OrderStatus.PENDING,
+        )
+        db_session.add(order)
+        await db_session.commit()
+
+        seat_key = f"flight:{flight.id}:seats"
+        await redis_client.delete(seat_key)
+        assert await redis_client.exists(seat_key) == 0
+
+        # Worker cancels expired order
+        success = await cancel_expired_order(
+            redis_client, str(order.id), str(flight.id), "3A", db=db_session
+        )
+        assert success is True
+
+        # Key must not be created
+        assert await redis_client.exists(seat_key) == 0
+
+        # Both seats available on hydration
+        seat_map = await get_flight_seat_map(db_session, redis_client, flight.id)
+        assert seat_map.total_seats == 2
+        assert seat_map.available_seats == 2

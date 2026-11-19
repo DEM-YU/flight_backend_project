@@ -53,6 +53,15 @@ end
 return 1
 """
 
+HSET_IF_KEY_EXISTS_SCRIPT = """
+if redis.call('EXISTS', KEYS[1]) == 1 then
+    redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
+    return 1
+else
+    return 0
+end
+"""
+
 
 
 
@@ -126,6 +135,17 @@ end
 
 def _cache_key(departure: str, arrival: str, date_str: str) -> str:
     return f"route:{departure.upper()}:{arrival.upper()}:{date_str}"
+
+
+async def _hset_seat_if_exists(
+    redis: aioredis.Redis,
+    flight_id: str | UUID,
+    seat_code: str,
+    state: str | int,
+) -> bool:
+    seat_key = f"flight:{flight_id}:seats"
+    res = await redis.eval(HSET_IF_KEY_EXISTS_SCRIPT, 1, seat_key, seat_code, str(state))
+    return res == 1
 
 
 async def search_flights(
@@ -307,18 +327,18 @@ async def reserve_seat(
                 "Database rejected reservation for seat %s on flight %s due to duplicate active order: %s",
                 seat_code, flight_id, exc,
             )
-            # Active order exists in DB; sync Redis to locked
-            await redis.hset(seat_key, seat_code, SeatState.LOCKED)
+            # Active order exists in DB; sync Redis to locked if key exists
+            await _hset_seat_if_exists(redis, flight_id, seat_code, SeatState.LOCKED)
             raise SeatUnavailableException(
                 f"Seat {seat_code} on flight {flight_id} is unavailable."
             ) from exc
         else:
-            # Rollback Redis lock on other integrity error
+            # Rollback Redis lock on other integrity error if key exists
             logger.error(
                 "DB integrity violation for seat %s on flight %s, rolling back Redis lock: %s",
                 seat_code, flight_id, exc,
             )
-            await redis.hset(seat_key, seat_code, SeatState.AVAILABLE)
+            await _hset_seat_if_exists(redis, flight_id, seat_code, SeatState.AVAILABLE)
             raise
     except Exception:
         logger.error(
@@ -326,7 +346,7 @@ async def reserve_seat(
             seat_code, flight_id, exc_info=True,
         )
         await db.rollback()
-        await redis.hset(seat_key, seat_code, SeatState.AVAILABLE)
+        await _hset_seat_if_exists(redis, flight_id, seat_code, SeatState.AVAILABLE)
         raise
 
     # 2. Enqueue timeout task; compensate on failure
@@ -422,14 +442,21 @@ async def release_seat_with_retry(
     order_id: str | UUID,
     max_retries: int = _SEAT_RELEASE_MAX_RETRIES,
 ) -> bool:
-    seat_key = f"flight:{flight_id}:seats"
     for attempt in range(max_retries):
         try:
-            await redis.hset(seat_key, seat_code, SeatState.AVAILABLE)
-            logger.info(
-                "Seat %s released on flight %s after order %s cancellation",
-                seat_code, flight_id, order_id,
+            updated = await _hset_seat_if_exists(
+                redis, flight_id, seat_code, SeatState.AVAILABLE
             )
+            if updated:
+                logger.info(
+                    "Seat %s released on flight %s after order %s cancellation",
+                    seat_code, flight_id, order_id,
+                )
+            else:
+                logger.info(
+                    "Seat map key for flight %s does not exist in Redis, skipping seat %s release (will hydrate on next query)",
+                    flight_id, seat_code,
+                )
             return True
         except Exception:
             logger.error(
@@ -572,8 +599,7 @@ async def pay_order(
         try:
             await redis.zrem(ORDER_TIMEOUT_QUEUE_KEY, order_task)
             await redis.delete(f"order:timeout:retry:{order.id}")
-            seat_key = f"flight:{order.flight_id}:seats"
-            await redis.hset(seat_key, order.seat_code, SeatState.LOCKED)
+            await _hset_seat_if_exists(redis, order.flight_id, order.seat_code, SeatState.LOCKED)
             logger.info("Order %s paid; timeout queue cleared and seat confirmed locked in Redis", order.id)
         except Exception:
             logger.warning(
