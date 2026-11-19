@@ -63,6 +63,6 @@ async def get_current_user_id(token: str = Depends(oauth2_scheme)) -> uuid.UUID:
         if user_id_str is None or token_type != "access":
             raise credentials_exception
 
-        return uuid.UUID(user_id_str)
-    except jwt.PyJWTError:
+        return uuid.UUID(str(user_id_str))
+    except (jwt.PyJWTError, ValueError):
         raise credentials_exception

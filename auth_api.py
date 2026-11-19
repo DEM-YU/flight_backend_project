@@ -106,7 +106,8 @@ async def refresh(
         user_id_str = claims.get("sub")
         if not user_id_str or token_type != "refresh":
             raise jwt.PyJWTError()
-    except jwt.PyJWTError:
+        user_id = uuid.UUID(str(user_id_str))
+    except (jwt.PyJWTError, ValueError):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired refresh token."
@@ -120,5 +121,5 @@ async def refresh(
             detail="Refresh token has been invalidated or expired."
         )
 
-    new_access_token = create_access_token(uuid.UUID(user_id_str))
+    new_access_token = create_access_token(user_id)
     return {"access_token": new_access_token, "token_type": "bearer"}

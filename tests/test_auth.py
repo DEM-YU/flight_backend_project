@@ -59,6 +59,19 @@ async def test_get_current_user_id_invalid():
 
 
 @pytest.mark.asyncio
+async def test_get_current_user_id_malformed_uuid():
+    token = jwt.encode(
+        {"sub": "user_test", "type": "access"},
+        settings.JWT_SECRET_KEY,
+        algorithm=settings.JWT_ALGORITHM,
+    )
+    with pytest.raises(HTTPException) as exc:
+        await get_current_user_id(token)
+    assert exc.value.status_code == status.HTTP_401_UNAUTHORIZED
+    assert exc.value.detail == "Invalid or expired access token."
+
+
+@pytest.mark.asyncio
 class TestAuthAPI:
     async def test_register_success(self, async_client, db_session):
         email = f"new_{uuid.uuid4().hex[:6]}@example.com"
@@ -223,3 +236,30 @@ class TestAuthAPI:
         )
         assert resp.status_code == 401
         assert "Refresh token has been invalidated or expired" in resp.json()["detail"]
+
+    async def test_refresh_malformed_uuid_sub(self, async_client):
+        token = jwt.encode(
+            {"sub": "user_test", "type": "refresh"},
+            settings.JWT_SECRET_KEY,
+            algorithm=settings.JWT_ALGORITHM,
+        )
+        resp = await async_client.post(
+            "/api/v1/auth/refresh",
+            json={"refresh_token": token},
+        )
+        assert resp.status_code == 401
+        assert "Invalid or expired refresh token" in resp.json()["detail"]
+
+    async def test_authenticated_route_malformed_uuid_sub_returns_401(self, async_client):
+        token = jwt.encode(
+            {"sub": "user_test", "type": "access"},
+            settings.JWT_SECRET_KEY,
+            algorithm=settings.JWT_ALGORITHM,
+        )
+        resp = await async_client.post(
+            "/api/v1/orders/reserve",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"flight_id": str(uuid.uuid4()), "seat_code": "1A"},
+        )
+        assert resp.status_code == 401
+        assert "Invalid or expired access token" in resp.json()["detail"]
