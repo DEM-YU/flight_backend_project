@@ -315,8 +315,7 @@ async def run_benchmark(
             print(f"      - {categories['service_unavailable']} requests received HTTP 503 ('Service temporarily unavailable').")
             print(f"      - ROOT CAUSE: Exceeded configured redis_pool connection limit ({settings.REDIS_MAX_CONNECTIONS}).")
             print(f"      - Concurrency exceeded the active connection pool boundary ({settings.REDIS_MAX_CONNECTIONS}).")
-            print("      - PROOF: Your core business logic did NOT fail. The failure is a resource quota ceiling")
-            print("        designed to protect system RAM from unbounded connection growth.")
+            print("      - Resource quota ceiling reached; connection pool protected RAM from unbounded growth.")
         if categories["timeout"] > 0 or categories["connection_error"] > 0:
             print(f"      - {categories['timeout']} client timeouts / {categories['connection_error']} socket drops.")
         print(f"  ✓ Redis CAS lock remained fully intact: {categories['success']} winner, {categories['conflict']} rejected.")
@@ -342,8 +341,8 @@ async def run_benchmark(
             print(f"  💥 CONNECTION POOL BREACH: {categories['service_unavailable']} requests rejected (pool max={settings.REDIS_MAX_CONNECTIONS}).")
         if categories["connection_error"] > 0:
             print(f"  💥 TCP SOCKET BACKLOG DROP: {categories['connection_error']} connections dropped by OS network stack.")
-        print("  ✓ PROVES: The system's true physical bottleneck is single-core CPU saturation and pool limits.")
-        print("  ✓ ARCHITECTURE LESSON: Scaling past 2,000+ instant concurrency requires multi-worker deployment (Gunicorn) and Nginx.")
+        print("  - Bottleneck identified: single-core event-loop saturation and connection pool ceilings.")
+        print("  - Scaling note: Sustaining >2,000 req/s requires multi-worker deployment and reverse proxy buffering.")
 
     elif mode == "pool-exhaust":
         print("\n  [DIAGNOSTIC: DATABASE CONNECTION POOL SATURATION]")

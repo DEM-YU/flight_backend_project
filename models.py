@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime, timezone
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
 from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, Integer, String, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -148,13 +148,13 @@ class OrderResponse(BaseModel):
 
 
 class RegisterRequest(BaseModel):
-    email: str
-    password: str
+    email: EmailStr = Field(max_length=255)
+    password: str = Field(min_length=6, max_length=72)
 
 
 class LoginRequest(BaseModel):
-    email: str
-    password: str
+    email: EmailStr = Field(max_length=255)
+    password: str = Field(max_length=72)
 
 
 class TokenResponse(BaseModel):

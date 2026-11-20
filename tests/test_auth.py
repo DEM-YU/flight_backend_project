@@ -126,6 +126,37 @@ class TestAuthAPI:
             assert resp.status_code == 409
             assert "Email already registered" in resp.json()["detail"]
 
+    async def test_register_invalid_email_format(self, async_client):
+        resp = await async_client.post(
+            "/api/v1/auth/register",
+            json={"email": "invalid-email-format", "password": "password123"},
+        )
+        assert resp.status_code == 422
+
+    async def test_register_email_too_long(self, async_client):
+        long_email = f"{'a' * 250}@example.com"
+        resp = await async_client.post(
+            "/api/v1/auth/register",
+            json={"email": long_email, "password": "password123"},
+        )
+        assert resp.status_code == 422
+
+    async def test_register_password_length_bounds(self, async_client):
+        valid_email = f"pass_{uuid.uuid4().hex[:6]}@example.com"
+        # Password too short (< 6 chars)
+        resp_short = await async_client.post(
+            "/api/v1/auth/register",
+            json={"email": valid_email, "password": "12345"},
+        )
+        assert resp_short.status_code == 422
+
+        # Password too long (> 72 bytes)
+        resp_long = await async_client.post(
+            "/api/v1/auth/register",
+            json={"email": valid_email, "password": "a" * 73},
+        )
+        assert resp_long.status_code == 422
+
     async def test_login_success(self, async_client, redis_client):
         email = f"login_{uuid.uuid4().hex[:6]}@example.com"
         await async_client.post(

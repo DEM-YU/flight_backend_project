@@ -1,12 +1,15 @@
+import asyncio
 import json
 import uuid
 from datetime import date, datetime, timezone
 from unittest.mock import AsyncMock, patch
 
+import jwt
 import pytest
 from sqlalchemy import select
 
 from auth import hash_password
+from database import settings
 from models import Flight, Order, OrderStatus, Seat, SeatState, User
 from services import (
     ORDER_TIMEOUT_QUEUE_KEY,
@@ -327,6 +330,46 @@ class TestReserveSeat:
         # Redis seat lock MUST be rolled back to '0' to prevent ghost locks
         status_after_rollback = await redis_client.hget(seat_key, "3C")
         assert status_after_rollback == SeatState.AVAILABLE
+
+    async def test_concurrent_seat_reservation_collision(
+        self, async_client, db_session, redis_client
+    ):
+        """Simulate 10 concurrent requests competing for the exact same seat via asyncio.gather."""
+        flight = await _create_test_flight(db_session)
+        await _create_test_seat(db_session, flight.id, "1A")
+
+        seat_key = f"flight:{flight.id}:seats"
+        await redis_client.hset(seat_key, "1A", SeatState.AVAILABLE)
+
+        users = [await _create_test_user(db_session) for _ in range(10)]
+        tokens = [
+            jwt.encode(
+                {"sub": str(u.id), "type": "access"},
+                settings.JWT_SECRET_KEY,
+                algorithm=settings.JWT_ALGORITHM,
+            )
+            for u in users
+        ]
+
+        async def send_reservation(token: str):
+            headers = {"Authorization": f"Bearer {token}"}
+            payload = {"flight_id": str(flight.id), "seat_code": "1A"}
+            return await async_client.post(
+                "/api/v1/orders/reserve", json=payload, headers=headers
+            )
+
+        responses = await asyncio.gather(*(send_reservation(t) for t in tokens))
+
+        status_codes = [r.status_code for r in responses]
+        assert status_codes.count(201) == 1
+        assert status_codes.count(409) == 9
+
+        stmt = select(Order).where(Order.flight_id == flight.id, Order.seat_code == "1A")
+        orders = (await db_session.execute(stmt)).scalars().all()
+        assert len(orders) == 1
+        assert orders[0].status == OrderStatus.PENDING
+
+        assert await redis_client.hget(seat_key, "1A") == SeatState.LOCKED
 
     async def test_database_partial_unique_index_prevents_duplicate_active_orders(
         self, db_session, redis_client
