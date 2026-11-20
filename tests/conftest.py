@@ -31,6 +31,12 @@ async def ensure_tables():
                 "WHERE status IN ('Pending', 'Confirmed');"
             )
         )
+        await conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_flight_search "
+                "ON flights (departure, arrival, departure_time);"
+            )
+        )
 
 
 @pytest_asyncio.fixture

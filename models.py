@@ -42,7 +42,7 @@ class User(Base):
 class Flight(Base):
     __tablename__ = "flights"
     __table_args__ = (
-        Index("ix_flight_departure_arrival", "departure", "arrival"),
+        Index("ix_flight_search", "departure", "arrival", "departure_time"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(

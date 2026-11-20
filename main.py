@@ -32,6 +32,12 @@ async def lifespan(app: FastAPI):
                 "WHERE status IN ('Pending', 'Confirmed');"
             )
         )
+        await conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_flight_search "
+                "ON flights (departure, arrival, departure_time);"
+            )
+        )
 
     worker_redis = aioredis.Redis(connection_pool=redis_pool)
     worker_task = asyncio.create_task(run_timeout_worker(worker_redis))

@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, patch
 
 import jwt
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from auth import hash_password
 from database import settings
@@ -109,6 +109,16 @@ class TestSearchFlights:
         cache_key = f"route:NON:EXIST:{today.isoformat()}"
         ttl = await redis_client.ttl(cache_key)
         assert 0 < ttl <= 60
+
+    async def test_flight_search_composite_index_exists(self, db_session):
+        res = await db_session.execute(
+            text("SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'flights';")
+        )
+        indexes = {row[0]: row[1] for row in res.fetchall()}
+        assert "ix_flight_search" in indexes
+        assert "departure" in indexes["ix_flight_search"]
+        assert "arrival" in indexes["ix_flight_search"]
+        assert "departure_time" in indexes["ix_flight_search"]
 
 
 class TestFlightSeatMap:
