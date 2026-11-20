@@ -10,10 +10,11 @@ from redis.exceptions import RedisError
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
+from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 from api import router
 from auth_api import router as auth_router
-from database import engine, get_db, get_redis, redis_pool
+from database import engine, get_db, get_redis, redis_pool, settings
 from models import Base
 from services import BookingDomainException, run_timeout_worker
 
@@ -54,6 +55,11 @@ app = FastAPI(
     description="High-concurrency transatlantic flight booking system.",
     version="0.4.0",
     lifespan=lifespan,
+)
+
+app.add_middleware(
+    ProxyHeadersMiddleware,
+    trusted_hosts=settings.FORWARDED_ALLOW_IPS,
 )
 
 

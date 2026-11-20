@@ -52,11 +52,7 @@ class RateLimiter:
             except jwt.PyJWTError:
                 pass
 
-        forwarded = request.headers.get("x-forwarded-for")
-        if forwarded:
-            client_host = forwarded.split(",")[0].strip()
-        else:
-            client_host = request.client.host if request.client else "unknown"
+        client_host = request.client.host if request.client else "unknown"
         return f"ip:{client_host}"
 
     async def __call__(

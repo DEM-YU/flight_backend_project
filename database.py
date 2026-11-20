@@ -26,6 +26,8 @@ class Settings(BaseSettings):
     RATE_LIMIT_AUTH_TIMES: int = 5
     RATE_LIMIT_AUTH_SECONDS: int = 60
 
+    FORWARDED_ALLOW_IPS: str = "127.0.0.1"
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     @property
