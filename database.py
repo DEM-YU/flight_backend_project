@@ -28,6 +28,8 @@ class Settings(BaseSettings):
 
     FORWARDED_ALLOW_IPS: str = "127.0.0.1"
 
+    SEAT_MAP_CACHE_TTL: int = 7200
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     @property

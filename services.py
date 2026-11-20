@@ -11,7 +11,7 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from database import AsyncSessionLocal
+from database import AsyncSessionLocal, settings
 from models import (
     Flight,
     FlightResponse,
@@ -29,6 +29,7 @@ _CACHE_TTL_BASE = 1800
 _CACHE_TTL_JITTER = 300
 # Negative cache TTL
 _CACHE_EMPTY_TTL = 60
+_SEAT_MAP_CACHE_TTL = settings.SEAT_MAP_CACHE_TTL
 
 _ORDER_TIMEOUT_SECONDS = 60
 _ORDER_TIMEOUT_RETRY_DELAY = 5
@@ -47,8 +48,12 @@ return items
 
 HYDRATE_SEAT_MAP_SCRIPT = """
 local key = KEYS[1]
-for i = 1, #ARGV, 2 do
+local ttl = tonumber(ARGV[1])
+for i = 2, #ARGV, 2 do
     redis.call('HSETNX', key, ARGV[i], ARGV[i + 1])
+end
+if ttl and ttl > 0 then
+    redis.call('EXPIRE', key, ttl)
 end
 return 1
 """
@@ -233,8 +238,8 @@ async def get_flight_seat_map(
                 is_locked = (s.status == 1 or s.seat_code in active_seats)
                 args.extend([s.seat_code, str(SeatState.LOCKED if is_locked else SeatState.AVAILABLE)])
 
-            # HSETNX prevents overwriting concurrent locks
-            await redis.eval(HYDRATE_SEAT_MAP_SCRIPT, 1, seat_key, *args)
+            # Hydrate seat map with TTL
+            await redis.eval(HYDRATE_SEAT_MAP_SCRIPT, 1, seat_key, _SEAT_MAP_CACHE_TTL, *args)
             seat_map = await redis.hgetall(seat_key)
         else:
             seat_map = {}

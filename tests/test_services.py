@@ -142,9 +142,11 @@ class TestFlightSeatMap:
         assert [s.seat_code for s in seat_map.seats] == ["1A", "1B"]
         assert all(s.is_available for s in seat_map.seats)
 
-        # 2. Verify Redis Hash was physically populated
+        # Verify Redis cache and TTL
         cached_seats = await redis_client.hgetall(seat_key)
         assert cached_seats == {"1A": "0", "1B": "0"}
+        ttl = await redis_client.ttl(seat_key)
+        assert 0 < ttl <= settings.SEAT_MAP_CACHE_TTL
 
     async def test_get_seat_map_reflects_locked_seats(self, db_session, redis_client):
         """Verify seat map returns accurate availability when a seat is locked in Redis."""
