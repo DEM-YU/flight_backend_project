@@ -294,3 +294,46 @@ class TestAuthAPI:
         )
         assert resp.status_code == 401
         assert "Invalid or expired access token" in resp.json()["detail"]
+
+    async def test_register_rate_limiter_blocks_excessive_requests(self, async_client):
+        for i in range(settings.RATE_LIMIT_AUTH_TIMES):
+            resp = await async_client.post(
+                "/api/v1/auth/register",
+                json={"email": f"rl_reg_{i}_{uuid.uuid4().hex[:6]}@example.com", "password": "password123"},
+            )
+            assert resp.status_code == 201
+
+        blocked_resp = await async_client.post(
+            "/api/v1/auth/register",
+            json={"email": f"rl_reg_blocked_{uuid.uuid4().hex[:6]}@example.com", "password": "password123"},
+        )
+        assert blocked_resp.status_code == 429
+        assert "Too many requests" in blocked_resp.json()["detail"]
+        assert int(blocked_resp.headers["Retry-After"]) >= 1
+        assert blocked_resp.headers["X-RateLimit-Limit"] == str(settings.RATE_LIMIT_AUTH_TIMES)
+        assert blocked_resp.headers["X-RateLimit-Remaining"] == "0"
+
+    async def test_login_rate_limiter_blocks_excessive_requests(self, async_client):
+        email = f"rl_login_{uuid.uuid4().hex[:6]}@example.com"
+        await async_client.post(
+            "/api/v1/auth/register",
+            json={"email": email, "password": "password123"},
+        )
+
+        for _ in range(settings.RATE_LIMIT_AUTH_TIMES):
+            resp = await async_client.post(
+                "/api/v1/auth/login",
+                json={"email": email, "password": "wrong_password"},
+            )
+            assert resp.status_code == 401
+
+        blocked_resp = await async_client.post(
+            "/api/v1/auth/login",
+            json={"email": email, "password": "password123"},
+        )
+        assert blocked_resp.status_code == 429
+        assert "Too many requests" in blocked_resp.json()["detail"]
+        assert int(blocked_resp.headers["Retry-After"]) >= 1
+        assert blocked_resp.headers["X-RateLimit-Limit"] == str(settings.RATE_LIMIT_AUTH_TIMES)
+        assert blocked_resp.headers["X-RateLimit-Remaining"] == "0"
+

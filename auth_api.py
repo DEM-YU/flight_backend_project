@@ -22,11 +22,21 @@ from auth import (
     create_access_token,
     create_refresh_token,
 )
+from rate_limiter import RateLimiter
 
 router = APIRouter(prefix="/api/v1/auth", tags=["Auth"])
 
+auth_limiter = RateLimiter(
+    times=settings.RATE_LIMIT_AUTH_TIMES,
+    seconds=settings.RATE_LIMIT_AUTH_SECONDS,
+)
 
-@router.post("/register", status_code=status.HTTP_201_CREATED)
+
+@router.post(
+    "/register",
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(auth_limiter)],
+)
 async def register(req: RegisterRequest, db: Annotated[AsyncSession, Depends(get_db)]):
     email = req.email.strip().lower()
     stmt = select(User).where(User.email == email)
@@ -51,7 +61,11 @@ async def register(req: RegisterRequest, db: Annotated[AsyncSession, Depends(get
     return {"message": "User registered successfully.", "email": user.email}
 
 
-@router.post("/login", response_model=TokenResponse)
+@router.post(
+    "/login",
+    response_model=TokenResponse,
+    dependencies=[Depends(auth_limiter)],
+)
 async def login(
     req: LoginRequest,
     db: Annotated[AsyncSession, Depends(get_db)],

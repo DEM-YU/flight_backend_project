@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     RATE_LIMIT_RESERVE_TIMES: int = 10
     RATE_LIMIT_RESERVE_SECONDS: int = 10
 
+    RATE_LIMIT_AUTH_TIMES: int = 5
+    RATE_LIMIT_AUTH_SECONDS: int = 60
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     @property
