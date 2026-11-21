@@ -223,7 +223,7 @@ class TestAuthAPI:
         assert resp.status_code == 400
         assert "Token is already invalid" in resp.json()["detail"]
 
-    async def test_refresh_success(self, async_client):
+    async def test_refresh_success(self, async_client, redis_client):
         email = f"refresh_{uuid.uuid4().hex[:6]}@example.com"
         await async_client.post(
             "/api/v1/auth/register",
@@ -233,14 +233,34 @@ class TestAuthAPI:
             "/api/v1/auth/login",
             json={"email": email, "password": "password123"},
         )
-        refresh_token = login_resp.json()["refresh_token"]
+        old_refresh_token = login_resp.json()["refresh_token"]
 
         resp = await async_client.post(
             "/api/v1/auth/refresh",
-            json={"refresh_token": refresh_token},
+            json={"refresh_token": old_refresh_token},
         )
         assert resp.status_code == 200
-        assert "access_token" in resp.json()
+        data = resp.json()
+        assert "access_token" in data
+        assert "refresh_token" in data
+        new_refresh_token = data["refresh_token"]
+        assert new_refresh_token != old_refresh_token
+
+        # Verify old token was removed from Redis
+        old_exists = await redis_client.exists(f"refresh_token:{old_refresh_token}")
+        assert old_exists == 0
+
+        # Verify new rotated token exists in Redis
+        new_exists = await redis_client.exists(f"refresh_token:{new_refresh_token}")
+        assert new_exists == 1
+
+        # Replay returns 401
+        replay_resp = await async_client.post(
+            "/api/v1/auth/refresh",
+            json={"refresh_token": old_refresh_token},
+        )
+        assert replay_resp.status_code == 401
+        assert "Refresh token has been invalidated or expired" in replay_resp.json()["detail"]
 
     async def test_refresh_invalidated_by_logout(self, async_client):
         email = f"inv_{uuid.uuid4().hex[:6]}@example.com"

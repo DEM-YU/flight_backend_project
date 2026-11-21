@@ -40,6 +40,7 @@ def create_refresh_token(user_id: uuid.UUID) -> str:
         "sub": str(user_id),
         "exp": expire,
         "type": "refresh",
+        "jti": str(uuid.uuid4()),
     }
     return jwt.encode(claims, settings.JWT_SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
 

@@ -105,7 +105,7 @@ async def logout(
     return {"message": "Logged out successfully. Token invalidated."}
 
 
-@router.post("/refresh")
+@router.post("/refresh", response_model=TokenResponse)
 async def refresh(
     req: RefreshRequest,
     redis: Annotated[aioredis.Redis, Depends(get_redis)],
@@ -127,13 +127,24 @@ async def refresh(
             detail="Invalid or expired refresh token."
         )
 
+    # Rotate refresh token
     redis_key = f"refresh_token:{req.refresh_token}"
-    exists = await redis.exists(redis_key)
-    if not exists:
+    deleted = await redis.delete(redis_key)
+    if not deleted:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Refresh token has been invalidated or expired."
         )
 
     new_access_token = create_access_token(user_id)
-    return {"access_token": new_access_token, "token_type": "bearer"}
+    new_refresh_token = create_refresh_token(user_id)
+
+    new_redis_key = f"refresh_token:{new_refresh_token}"
+    ttl_seconds = settings.REFRESH_TOKEN_EXPIRE_DAYS * 24 * 3600
+    await redis.setex(new_redis_key, ttl_seconds, str(user_id))
+
+    return TokenResponse(
+        access_token=new_access_token,
+        refresh_token=new_refresh_token,
+        token_type="bearer",
+    )
